@@ -87,6 +87,8 @@ pub fn start(args: &mut [String]) {
     frame.set_title(&crate::get_app_name());
     #[cfg(target_os = "macos")]
     crate::platform::delegate::make_menubar(frame.get_host(), args.is_empty());
+    #[cfg(windows)]
+    crate::platform::try_set_window_foreground(frame.get_hwnd() as _);
     let page;
     if args.len() > 1 && args[0] == "--play" {
         args[0] = "--connect".to_owned();
@@ -600,8 +602,8 @@ impl UI {
         get_langs()
     }
 
-    fn default_video_save_directory(&self) -> String {
-        default_video_save_directory()
+    fn video_save_directory(&self, root: bool) -> String {
+        video_save_directory(root)
     }
 
     fn handle_relay_id(&self, id: String) -> String {
@@ -723,7 +725,7 @@ impl sciter::EventHandler for UI {
         fn has_hwcodec();
         fn has_vram();
         fn get_langs();
-        fn default_video_save_directory();
+        fn video_save_directory(bool);
         fn handle_relay_id(String);
         fn get_login_device_info();
         fn support_remove_wallpaper();
