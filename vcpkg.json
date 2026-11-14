@@ -21,12 +21,9 @@
       "host": false
     },
     {
-      "name": "oboe",
-      "platform": "android"
-    },
-    {
-      "name": "oboe-wrapper",
-      "platform": "android"
+      "name": "libsodium",
+      "host": false,
+      "platform": "windows & arm64"
     },
     {
       "name": "opus",
@@ -51,13 +48,62 @@
     {
       "name": "libyuv",
       "host": false
+    },
+    {
+      "name": "mfx-dispatch",
+      "host": true,
+      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "mfx-dispatch",
+      "host": false,
+      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
+    },
+    {
+      "name": "ffmpeg",
+      "host": true,
+      "features": [
+        {
+          "name": "amf",
+          "platform": "(((windows & !arm) | linux) & static)"
+        },
+        {
+          "name": "nvcodec",
+          "platform": "(((windows & !arm) | linux) & static)"
+        },
+        {
+          "name": "qsv",
+          "platform": "(windows & !arm & static)"
+        }
+      ],
+      "platform": "((windows | (linux & !arm32) | osx) & static)"
+    },
+    {
+      "name": "ffmpeg",
+      "host": false,
+      "platform": "((android | ios | (linux & arm32)) & static)"
     }
   ],
   "vcpkg-configuration": {
     "default-registry": {
       "kind": "builtin",
-      "baseline": ""
+      "baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d"
     },
-    "overlay-ports": [ "./res/vcpkg" ]
-  }
+    "overlay-ports": [
+      "./res/vcpkg"
+    ],
+    "overlay-triplets": [
+      "./res/vcpkg-triplets"
+    ]
+  },
+  "overrides": [
+    {
+      "name": "ffnvcodec",
+      "version": "12.1.14.0"
+    },
+    {
+      "name": "amd-amf",
+      "version": "1.4.35"
+    }
+  ]
 }

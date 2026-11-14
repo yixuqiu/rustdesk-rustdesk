@@ -5,7 +5,7 @@ use hbb_common::{
 };
 use scrap::{
     aom::{AomDecoder, AomEncoder, AomEncoderConfig},
-    codec::{EncoderApi, EncoderCfg, Quality as Q},
+    codec::{EncoderApi, EncoderCfg},
     Capturer, Display, TraitCapturer, VpxDecoder, VpxDecoderConfig, VpxEncoder, VpxEncoderConfig,
     VpxVideoCodecId::{self, *},
     STRIDE_ALIGN,
@@ -27,23 +27,15 @@ Usage:
 Options:
   -h --help             Show this screen.
   --count=COUNT         Capture frame count [default: 100].
-  --quality=QUALITY     Video quality [default: Balanced].
-                        Valid values: Best, Balanced, Low.
+  --quality=QUALITY     Video quality [default: 1.0].
   --i444                I444.
 ";
 
 #[derive(Debug, serde::Deserialize, Clone, Copy)]
 struct Args {
     flag_count: usize,
-    flag_quality: Quality,
+    flag_quality: f32,
     flag_i444: bool,
-}
-
-#[derive(Debug, serde::Deserialize, Clone, Copy)]
-enum Quality {
-    Best,
-    Balanced,
-    Low,
 }
 
 fn main() {
@@ -70,11 +62,6 @@ fn main() {
         "benchmark {}x{} quality:{:?}, i444:{:?}",
         width, height, quality, args.flag_i444
     );
-    let quality = match quality {
-        Quality::Best => Q::Best,
-        Quality::Balanced => Q::Balanced,
-        Quality::Low => Q::Low,
-    };
     [VP8, VP9].map(|codec| {
         test_vpx(
             &mut c,
@@ -98,7 +85,7 @@ fn test_vpx(
     codec_id: VpxVideoCodecId,
     width: usize,
     height: usize,
-    quality: Q,
+    quality: f32,
     yuv_count: usize,
     i444: bool,
 ) {
@@ -156,7 +143,7 @@ fn test_vpx(
     println!(
         "{:?} encode: {:?}, {} byte",
         codec_id,
-        time_sum / yuv_count as _,
+        time_sum / yuv_count as u32,
         size / yuv_count
     );
 
@@ -169,7 +156,7 @@ fn test_vpx(
     println!(
         "{:?} decode: {:?}",
         codec_id,
-        start.elapsed() / yuv_count as _
+        start.elapsed() / yuv_count as u32
     );
 }
 
@@ -177,7 +164,7 @@ fn test_av1(
     c: &mut Capturer,
     width: usize,
     height: usize,
-    quality: Q,
+    quality: f32,
     yuv_count: usize,
     i444: bool,
 ) {
@@ -225,7 +212,7 @@ fn test_av1(
     assert_eq!(av1s.len(), yuv_count);
     println!(
         "AV1 encode: {:?}, {} byte",
-        time_sum / yuv_count as _,
+        time_sum / yuv_count as u32,
         size / yuv_count
     );
     let mut decoder = AomDecoder::new().unwrap();
@@ -234,7 +221,7 @@ fn test_av1(
         let _ = decoder.decode(&av1);
         let _ = decoder.flush();
     }
-    println!("AV1 decode: {:?}", start.elapsed() / yuv_count as _);
+    println!("AV1 decode: {:?}", start.elapsed() / yuv_count as u32);
 }
 
 #[cfg(feature = "hwcodec")]
@@ -247,7 +234,7 @@ mod hw {
 
     use super::*;
 
-    pub fn test(c: &mut Capturer, width: usize, height: usize, quality: Q, yuv_count: usize) {
+    pub fn test(c: &mut Capturer, width: usize, height: usize, quality: f32, yuv_count: usize) {
         let mut h264s = Vec::new();
         let mut h265s = Vec::new();
         if let Some(info) = HwRamEncoder::try_get(CodecFormat::H264) {
@@ -263,7 +250,7 @@ mod hw {
     fn test_encoder(
         width: usize,
         height: usize,
-        quality: Q,
+        quality: f32,
         info: CodecInfo,
         c: &mut Capturer,
         yuv_count: usize,
@@ -272,6 +259,7 @@ mod hw {
         let mut encoder = HwRamEncoder::new(
             EncoderCfg::HWRAM(HwRamEncoderConfig {
                 name: info.name.clone(),
+                mc_name: None,
                 width,
                 height,
                 quality,
@@ -286,13 +274,17 @@ mod hw {
         let mut mid_data = Vec::new();
         let mut counter = 0;
         let mut time_sum = Duration::ZERO;
+        let start = std::time::Instant::now();
         loop {
             match c.frame(std::time::Duration::from_millis(30)) {
                 Ok(frame) => {
                     let tmp_timer = Instant::now();
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data).unwrap();
                     let yuv = frame.yuv().unwrap();
-                    for ref frame in encoder.encode(&yuv).unwrap() {
+                    for ref frame in encoder
+                        .encode(&yuv, start.elapsed().as_millis() as _)
+                        .unwrap()
+                    {
                         size += frame.data.len();
 
                         h26xs.push(frame.data.to_vec());

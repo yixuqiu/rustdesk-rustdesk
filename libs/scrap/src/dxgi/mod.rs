@@ -1,18 +1,20 @@
 use std::{io, mem, ptr, slice};
 pub mod gdi;
 pub use gdi::CapturerGDI;
+pub mod hdr;
 pub mod mag;
 
 use winapi::{
     shared::{
         dxgi::*,
         dxgi1_2::*,
+        dxgi1_6::*,
+        dxgiformat::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT},
         dxgitype::*,
         minwindef::{DWORD, FALSE, TRUE, UINT},
         ntdef::LONG,
-        windef::HMONITOR,
+        windef::{HMONITOR, RECT},
         winerror::*,
-        // dxgiformat::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_420_OPAQUE},
     },
     um::{
         d3d11::*, d3dcommon::D3D_DRIVER_TYPE_UNKNOWN, unknwnbase::IUnknown, wingdi::*,
@@ -41,6 +43,13 @@ impl<T> Drop for ComPtr<T> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum FrameState {
+    Idle,
+    Acquired,
+    Mapped,
+}
+
 pub struct Capturer {
     device: ComPtr<ID3D11Device>,
     display: Display,
@@ -57,6 +66,9 @@ pub struct Capturer {
     saved_raw_data: Vec<u8>, // for faster compare and copy
     output_texture: bool,
     adapter_desc1: DXGI_ADAPTER_DESC1,
+    rotate: Rotate,
+    frame_state: FrameState,
+    hdr: Option<hdr::HdrToSdr>,
 }
 
 impl Capturer {
@@ -104,7 +116,7 @@ impl Capturer {
             }
         } else {
             res = wrap_hresult(unsafe {
-                let hres = (*display.inner.0).DuplicateOutput(device.0 as *mut _, &mut duplication);
+                let hres = Self::duplicate_output(&display, device.0, &mut duplication);
                 if hres != S_OK {
                     gdi_capturer = display.create_gdi();
                     println!("Fallback to GDI");
@@ -116,6 +128,7 @@ impl Capturer {
                 } else {
                     hres
                 }
+
                 // NVFBC(NVIDIA Capture SDK) which xpra used already deprecated, https://developer.nvidia.com/capture-sdk
 
                 // also try high version DXGI for better performance, e.g.
@@ -127,6 +140,8 @@ impl Capturer {
                 // can help us update screen incrementally
 
                 /* // not supported on my PC, try in the future
+                use winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
+
                 let format : Vec<DXGI_FORMAT> = vec![DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_420_OPAQUE];
                 (*display.inner).DuplicateOutput1(
                     device as *mut _,
@@ -151,12 +166,14 @@ impl Capturer {
                 (*duplication).GetDesc(&mut desc);
             }
         }
+        let rotate = Self::create_rotations(device.0, context.0, &display);
 
         Ok(Capturer {
             device,
             context,
             duplication: ComPtr(duplication),
-            fastlane: desc.DesktopImageInSystemMemory == TRUE,
+            fastlane: desc.DesktopImageInSystemMemory == TRUE
+                && desc.ModeDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT,
             surface: ComPtr(ptr::null_mut()),
             texture: ComPtr(ptr::null_mut()),
             width: display.width() as usize,
@@ -168,7 +185,237 @@ impl Capturer {
             saved_raw_data: Vec::new(),
             output_texture: false,
             adapter_desc1,
+            rotate,
+            frame_state: FrameState::Idle,
+            hdr: None,
         })
+    }
+
+    // Asks for the float desktop that HDR mode composes so it can be tone-mapped;
+    // the legacy call would hand back DXGI's clipped BGRA8 conversion instead.
+    // Only where IDXGIOutput6 (Windows 10 1703) exists, since that is what later
+    // tells an HDR desktop from a WCG one; Microsoft's duplication sample gates
+    // the float request the same way.
+    unsafe fn duplicate_output(
+        display: &Display,
+        device: *mut ID3D11Device,
+        duplication: &mut *mut IDXGIOutputDuplication,
+    ) -> HRESULT {
+        if !hdr::UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut output6: *mut IDXGIOutput6 = ptr::null_mut();
+            (*display.inner.0).QueryInterface(
+                &IID_IDXGIOutput6,
+                &mut output6 as *mut *mut _ as *mut *mut _,
+            );
+            if !output6.is_null() {
+                let output6 = ComPtr(output6);
+                let formats = [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM];
+                let hres = (*output6.0).DuplicateOutput1(
+                    device as *mut _,
+                    0,
+                    formats.len() as UINT,
+                    formats.as_ptr(),
+                    duplication,
+                );
+                if hres == S_OK {
+                    return hres;
+                }
+                hbb_common::log::warn!(
+                    "HDR DuplicateOutput1 failed: hr={:#x}, fallback=DuplicateOutput",
+                    hres as u32
+                );
+            }
+        }
+        (*display.inner.0).DuplicateOutput(device as *mut _, duplication)
+    }
+
+    unsafe fn tonemap(
+        &mut self,
+        source: *mut ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> io::Result<*mut ID3D11Texture2D> {
+        if self.hdr.is_none() {
+            match hdr::HdrToSdr::new(
+                self.device.0,
+                self.context.0,
+                self.display.inner.0,
+                &self.display.desc.DeviceName,
+            ) {
+                Ok(hdr) => self.hdr = Some(hdr),
+                Err(err) => return self.abandon_tonemap(err),
+            }
+        }
+        let converted = match self.hdr.as_mut() {
+            Some(hdr) => hdr.convert(source, desc),
+            None => Err(io::Error::new(io::ErrorKind::Other, "no tone-map")),
+        };
+        match converted {
+            Ok(texture) => Ok(texture),
+            Err(err) => self.abandon_tonemap(err),
+        }
+    }
+
+    // Drops the tone-map and re-duplicates the output the legacy way, so DXGI
+    // hands over clipped BGRA8 (the pre-HDR behaviour). If re-duplication fails,
+    // switch to GDI before returning. The caller sees WouldBlock and asks again.
+    unsafe fn abandon_tonemap<T>(&mut self, err: io::Error) -> io::Result<T> {
+        if hdr::is_permanent(&err) {
+            hdr::UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        hbb_common::log::error!("HDR tone-map failed, re-duplicating without it: {err}");
+        self.hdr = None;
+        if let Err(release_err) = self.release_frame() {
+            hbb_common::log::warn!("DXGI frame cleanup failed while disabling HDR: {release_err}");
+        }
+        self.duplication = ComPtr(ptr::null_mut());
+        let mut duplication = ptr::null_mut();
+        let result = wrap_hresult(
+            (*self.display.inner.0).DuplicateOutput(self.device.0 as *mut _, &mut duplication),
+        );
+        if let Err(err) = result {
+            if self.set_gdi() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            return Err(err);
+        }
+        self.duplication = ComPtr(duplication);
+        let mut desc: DXGI_OUTDUPL_DESC = mem::zeroed();
+        (*duplication).GetDesc(&mut desc);
+        self.fastlane = desc.DesktopImageInSystemMemory == TRUE;
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    fn create_rotations(
+        device: *mut ID3D11Device,
+        context: *mut ID3D11DeviceContext,
+        display: &Display,
+    ) -> Rotate {
+        let mut video_context: *mut ID3D11VideoContext = ptr::null_mut();
+        let mut video_device: *mut ID3D11VideoDevice = ptr::null_mut();
+        let mut video_processor_enum: *mut ID3D11VideoProcessorEnumerator = ptr::null_mut();
+        let mut video_processor: *mut ID3D11VideoProcessor = ptr::null_mut();
+        let processor_rotation = match display.rotation() {
+            DXGI_MODE_ROTATION_ROTATE90 => Some(D3D11_VIDEO_PROCESSOR_ROTATION_90),
+            DXGI_MODE_ROTATION_ROTATE180 => Some(D3D11_VIDEO_PROCESSOR_ROTATION_180),
+            DXGI_MODE_ROTATION_ROTATE270 => Some(D3D11_VIDEO_PROCESSOR_ROTATION_270),
+            _ => None,
+        };
+        if let Some(processor_rotation) = processor_rotation {
+            println!("create rotations");
+            if !device.is_null() && !context.is_null() {
+                unsafe {
+                    (*context).QueryInterface(
+                        &IID_ID3D11VideoContext,
+                        &mut video_context as *mut *mut _ as *mut *mut _,
+                    );
+                    if !video_context.is_null() {
+                        (*device).QueryInterface(
+                            &IID_ID3D11VideoDevice,
+                            &mut video_device as *mut *mut _ as *mut *mut _,
+                        );
+                        if !video_device.is_null() {
+                            let (input_width, input_height) = match display.rotation() {
+                                DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => {
+                                    (display.height(), display.width())
+                                }
+                                _ => (display.width(), display.height()),
+                            };
+                            let (output_width, output_height) = (display.width(), display.height());
+                            let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                                InputFrameRate: DXGI_RATIONAL {
+                                    Numerator: 30,
+                                    Denominator: 1,
+                                },
+                                InputWidth: input_width as _,
+                                InputHeight: input_height as _,
+                                OutputFrameRate: DXGI_RATIONAL {
+                                    Numerator: 30,
+                                    Denominator: 1,
+                                },
+                                OutputWidth: output_width as _,
+                                OutputHeight: output_height as _,
+                                Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+                            };
+                            (*video_device).CreateVideoProcessorEnumerator(
+                                &content_desc,
+                                &mut video_processor_enum,
+                            );
+                            if !video_processor_enum.is_null() {
+                                let mut caps: D3D11_VIDEO_PROCESSOR_CAPS = mem::zeroed();
+                                if S_OK == (*video_processor_enum).GetVideoProcessorCaps(&mut caps)
+                                {
+                                    if caps.FeatureCaps
+                                        & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION
+                                        != 0
+                                    {
+                                        (*video_device).CreateVideoProcessor(
+                                            video_processor_enum,
+                                            0,
+                                            &mut video_processor,
+                                        );
+                                        if !video_processor.is_null() {
+                                            (*video_context).VideoProcessorSetStreamRotation(
+                                                video_processor,
+                                                0,
+                                                TRUE,
+                                                processor_rotation,
+                                            );
+                                            (*video_context)
+                                                .VideoProcessorSetStreamAutoProcessingMode(
+                                                    video_processor,
+                                                    0,
+                                                    FALSE,
+                                                );
+                                            (*video_context).VideoProcessorSetStreamFrameFormat(
+                                                video_processor,
+                                                0,
+                                                D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                                            );
+                                            (*video_context).VideoProcessorSetStreamSourceRect(
+                                                video_processor,
+                                                0,
+                                                TRUE,
+                                                &RECT {
+                                                    left: 0,
+                                                    top: 0,
+                                                    right: input_width as _,
+                                                    bottom: input_height as _,
+                                                },
+                                            );
+                                            (*video_context).VideoProcessorSetStreamDestRect(
+                                                video_processor,
+                                                0,
+                                                TRUE,
+                                                &RECT {
+                                                    left: 0,
+                                                    top: 0,
+                                                    right: output_width as _,
+                                                    bottom: output_height as _,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let video_context = ComPtr(video_context);
+        let video_device = ComPtr(video_device);
+        let video_processor_enum = ComPtr(video_processor_enum);
+        let video_processor = ComPtr(video_processor);
+        let rotated_texture = ComPtr(ptr::null_mut());
+        Rotate {
+            video_context,
+            video_device,
+            video_processor_enum,
+            video_processor,
+            texture: (rotated_texture, false),
+        }
     }
 
     pub fn is_gdi(&self) -> bool {
@@ -191,11 +438,15 @@ impl Capturer {
     }
 
     unsafe fn load_frame(&mut self, timeout: UINT) -> io::Result<(*const u8, i32)> {
+        if self.duplication.0.is_null() {
+            return Err(io::ErrorKind::AddrNotAvailable.into());
+        }
         let mut frame = ptr::null_mut();
         #[allow(invalid_value)]
         let mut info = mem::MaybeUninit::uninit().assume_init();
 
         wrap_hresult((*self.duplication.0).AcquireNextFrame(timeout, &mut info, &mut frame))?;
+        self.frame_state = FrameState::Acquired;
         let frame = ComPtr(frame);
 
         if *info.LastPresentTime.QuadPart() == 0 {
@@ -206,9 +457,11 @@ impl Capturer {
         let mut rect = mem::MaybeUninit::uninit().assume_init();
         if self.fastlane {
             wrap_hresult((*self.duplication.0).MapDesktopSurface(&mut rect))?;
+            self.frame_state = FrameState::Mapped;
         } else {
             self.surface = ComPtr(self.ohgodwhat(frame.0)?);
             wrap_hresult((*self.surface.0).Map(&mut rect, DXGI_MAP_READ))?;
+            self.frame_state = FrameState::Mapped;
         }
         Ok((rect.pBits, rect.Pitch))
     }
@@ -225,6 +478,12 @@ impl Capturer {
         #[allow(invalid_value)]
         let mut texture_desc = mem::MaybeUninit::uninit().assume_init();
         (*texture.0).GetDesc(&mut texture_desc);
+
+        let mut source = texture.0;
+        if texture_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            source = self.tonemap(texture.0, &texture_desc)?;
+            (*source).GetDesc(&mut texture_desc);
+        }
 
         texture_desc.Usage = D3D11_USAGE_STAGING;
         texture_desc.BindFlags = 0;
@@ -246,7 +505,7 @@ impl Capturer {
             &mut surface as *mut *mut _ as *mut *mut _,
         );
 
-        (*self.context.0).CopyResource(readable.0 as *mut _, texture.0 as *mut _);
+        (*self.context.0).CopyResource(readable.0 as *mut _, source as *mut _);
 
         Ok(surface)
     }
@@ -257,7 +516,7 @@ impl Capturer {
         } else {
             let width = self.width;
             let height = self.height;
-            Ok(Frame::PixelBuffer(PixelBuffer::new(
+            Ok(Frame::PixelBuffer(PixelBuffer::with_BGRA(
                 self.get_pixelbuffer(timeout)?,
                 width,
                 height,
@@ -285,7 +544,7 @@ impl Capturer {
                         }
                     }
                 } else {
-                    self.unmap();
+                    self.release_frame()?;
                     let r = self.load_frame(timeout)?;
                     let rotate = match self.display.rotation() {
                         DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED => kRotate0,
@@ -328,17 +587,18 @@ impl Capturer {
         }
     }
 
-    fn get_texture(&mut self, timeout: UINT) -> io::Result<*mut c_void> {
+    fn get_texture(&mut self, timeout: UINT) -> io::Result<(*mut c_void, usize)> {
         unsafe {
             if self.duplication.0.is_null() {
                 return Err(std::io::ErrorKind::AddrNotAvailable.into());
             }
-            (*self.duplication.0).ReleaseFrame();
+            self.release_frame()?;
             let mut frame = ptr::null_mut();
             #[allow(invalid_value)]
             let mut info = mem::MaybeUninit::uninit().assume_init();
 
             wrap_hresult((*self.duplication.0).AcquireNextFrame(timeout, &mut info, &mut frame))?;
+            self.frame_state = FrameState::Acquired;
             let frame = ComPtr(frame);
 
             if info.AccumulatedFrames == 0 || *info.LastPresentTime.QuadPart() == 0 {
@@ -352,20 +612,133 @@ impl Capturer {
             );
             let texture = ComPtr(texture);
             self.texture = texture;
-            Ok(self.texture.0 as *mut c_void)
+
+            let mut frame_desc: D3D11_TEXTURE2D_DESC = mem::zeroed();
+            (*self.texture.0).GetDesc(&mut frame_desc);
+            if frame_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                let converted = self.tonemap(self.texture.0, &frame_desc)?;
+                (*converted).AddRef();
+                self.texture = ComPtr(converted);
+            }
+
+            let mut final_texture = self.texture.0 as *mut c_void;
+            let mut rotation = match self.display.rotation() {
+                DXGI_MODE_ROTATION_ROTATE90 => 90,
+                DXGI_MODE_ROTATION_ROTATE180 => 180,
+                DXGI_MODE_ROTATION_ROTATE270 => 270,
+                _ => 0,
+            };
+            if rotation != 0
+                && !self.texture.is_null()
+                && !self.rotate.video_context.is_null()
+                && !self.rotate.video_device.is_null()
+                && !self.rotate.video_processor_enum.is_null()
+                && !self.rotate.video_processor.is_null()
+            {
+                let mut desc: D3D11_TEXTURE2D_DESC = mem::zeroed();
+                (*self.texture.0).GetDesc(&mut desc);
+                if rotation == 90 || rotation == 270 {
+                    let tmp = desc.Width;
+                    desc.Width = desc.Height;
+                    desc.Height = tmp;
+                }
+                if !self.rotate.texture.1 {
+                    self.rotate.texture.1 = true;
+                    let mut rotated_texture: *mut ID3D11Texture2D = ptr::null_mut();
+                    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+                    (*self.device.0).CreateTexture2D(&desc, ptr::null(), &mut rotated_texture);
+                    self.rotate.texture.0 = ComPtr(rotated_texture);
+                }
+                if !self.rotate.texture.0.is_null()
+                    && desc.Width == self.width as u32
+                    && desc.Height == self.height as u32
+                {
+                    let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                        FourCC: 0,
+                        ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                        Texture2D: D3D11_TEX2D_VPIV {
+                            ArraySlice: 0,
+                            MipSlice: 0,
+                        },
+                    };
+                    let mut input_view = ptr::null_mut();
+                    (*self.rotate.video_device.0).CreateVideoProcessorInputView(
+                        self.texture.0 as *mut _,
+                        self.rotate.video_processor_enum.0 as *mut _,
+                        &input_view_desc,
+                        &mut input_view,
+                    );
+                    if !input_view.is_null() {
+                        let input_view = ComPtr(input_view);
+                        let mut output_view_desc: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC =
+                            mem::zeroed();
+                        output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+                        output_view_desc.u.Texture2D_mut().MipSlice = 0;
+                        let mut output_view = ptr::null_mut();
+                        (*self.rotate.video_device.0).CreateVideoProcessorOutputView(
+                            self.rotate.texture.0 .0 as *mut _,
+                            self.rotate.video_processor_enum.0 as *mut _,
+                            &output_view_desc,
+                            &mut output_view,
+                        );
+                        if !output_view.is_null() {
+                            let output_view = ComPtr(output_view);
+                            let mut stream_data: D3D11_VIDEO_PROCESSOR_STREAM = mem::zeroed();
+                            stream_data.Enable = TRUE;
+                            stream_data.pInputSurface = input_view.0;
+                            (*self.rotate.video_context.0).VideoProcessorBlt(
+                                self.rotate.video_processor.0,
+                                output_view.0,
+                                0,
+                                1,
+                                &stream_data,
+                            );
+                            final_texture = self.rotate.texture.0 .0 as *mut c_void;
+                            rotation = 0;
+                        }
+                    }
+                }
+            }
+            Ok((final_texture, rotation))
         }
     }
 
-    fn unmap(&self) {
+    fn release_frame(&mut self) -> io::Result<()> {
+        if self.duplication.is_null() {
+            return Ok(());
+        }
+        let mut first_error = None;
+        // Unmap before ReleaseFrame invalidates the desktop surface; use the same
+        // order for staging surfaces. Cleanup advances Mapped -> Acquired -> Idle,
+        // while Idle is a no-op. Advance state even on errors to avoid retrying
+        // cleanup, but still attempt ReleaseFrame if unmapping fails.
         unsafe {
-            (*self.duplication.0).ReleaseFrame();
-            if self.fastlane {
-                (*self.duplication.0).UnMapDesktopSurface();
-            } else {
-                if !self.surface.is_null() {
-                    (*self.surface.0).Unmap();
+            if self.frame_state == FrameState::Mapped {
+                let result = if self.fastlane {
+                    wrap_hresult((*self.duplication.0).UnMapDesktopSurface())
+                } else if !self.surface.is_null() {
+                    wrap_hresult((*self.surface.0).Unmap())
+                } else {
+                    Ok(())
+                };
+                self.frame_state = FrameState::Acquired;
+                if let Err(err) = result {
+                    first_error = Some(err);
                 }
             }
+            if self.frame_state == FrameState::Acquired {
+                let result = wrap_hresult((*self.duplication.0).ReleaseFrame());
+                self.frame_state = FrameState::Idle;
+                if first_error.is_none() {
+                    if let Err(err) = result {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
@@ -381,8 +754,8 @@ impl Capturer {
 
 impl Drop for Capturer {
     fn drop(&mut self) {
-        if !self.duplication.is_null() {
-            self.unmap();
+        if let Err(err) = self.release_frame() {
+            eprintln!("DXGI frame cleanup failed: {err}");
         }
     }
 }
@@ -655,4 +1028,12 @@ fn wrap_hresult(x: HRESULT) -> io::Result<()> {
         }
     })
     .into())
+}
+
+struct Rotate {
+    video_context: ComPtr<ID3D11VideoContext>,
+    video_device: ComPtr<ID3D11VideoDevice>,
+    video_processor_enum: ComPtr<ID3D11VideoProcessorEnumerator>,
+    video_processor: ComPtr<ID3D11VideoProcessor>,
+    texture: (ComPtr<ID3D11Texture2D>, bool),
 }

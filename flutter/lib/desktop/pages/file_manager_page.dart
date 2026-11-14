@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:extended_text/extended_text.dart';
+import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/desktop/widgets/dragable_divider.dart';
 import 'package:percent_indicator/percent_indicator.dart';
 import 'package:desktop_drop/desktop_drop.dart';
@@ -15,7 +17,8 @@ import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:flutter_hbb/web/dummy.dart'
+    if (dart.library.html) 'package:flutter_hbb/web/web_unique.dart';
 
 import '../../consts.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
@@ -49,30 +52,42 @@ enum MouseFocusScope {
 }
 
 class FileManagerPage extends StatefulWidget {
-  const FileManagerPage(
+  FileManagerPage(
       {Key? key,
       required this.id,
       required this.password,
+      this.loginMethod = '',
       required this.isSharedPassword,
-      required this.tabController,
+      this.tabController,
+      this.connToken,
       this.forceRelay})
       : super(key: key);
   final String id;
   final String? password;
+  final String loginMethod;
   final bool? isSharedPassword;
   final bool? forceRelay;
-  final DesktopTabController tabController;
+  final String? connToken;
+  final DesktopTabController? tabController;
+  final SimpleWrapper<State<FileManagerPage>?> _lastState = SimpleWrapper(null);
+
+  FFI get ffi => (_lastState.value! as _FileManagerPageState)._ffi;
 
   @override
-  State<StatefulWidget> createState() => _FileManagerPageState();
+  State<StatefulWidget> createState() {
+    final state = _FileManagerPageState();
+    _lastState.value = state;
+    return state;
+  }
 }
 
 class _FileManagerPageState extends State<FileManagerPage>
-    with AutomaticKeepAliveClientMixin {
+    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   final _mouseFocusScope = Rx<MouseFocusScope>(MouseFocusScope.none);
 
   final _dropMaskVisible = false.obs; // TODO impl drop mask
   final _overlayKeyState = OverlayKeyState();
+  final _uniqueKey = UniqueKey();
 
   late FFI _ffi;
 
@@ -86,19 +101,26 @@ class _FileManagerPageState extends State<FileManagerPage>
     _ffi.start(widget.id,
         isFileTransfer: true,
         password: widget.password,
+        loginMethod: widget.loginMethod,
         isSharedPassword: widget.isSharedPassword,
+        connToken: widget.connToken,
         forceRelay: widget.forceRelay);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _ffi.dialogManager
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
     });
-    Get.put(_ffi, tag: 'ft_${widget.id}');
-    if (!isLinux) {
-      WakelockPlus.enable();
+    Get.put<FFI>(_ffi, tag: 'ft_${widget.id}');
+    WakelockManager.enable(_uniqueKey);
+    if (isWeb) {
+      _ffi.ffiModel.updateEventListener(_ffi.sessionId, widget.id);
     }
     debugPrint("File manager page init success with id ${widget.id}");
     _ffi.dialogManager.setOverlayState(_overlayKeyState);
-    widget.tabController.onSelected?.call(widget.id);
+    // Call onSelected in post frame callback, since we cannot guarantee that the callback will not call setState.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.tabController?.onSelected?.call(widget.id);
+    });
+    WidgetsBinding.instance.addObserver(this);
   }
 
   @override
@@ -106,11 +128,10 @@ class _FileManagerPageState extends State<FileManagerPage>
     model.close().whenComplete(() {
       _ffi.close();
       _ffi.dialogManager.dismissAll();
-      if (!isLinux) {
-        WakelockPlus.disable();
-      }
+      WakelockManager.disable(_uniqueKey);
       Get.delete<FFI>(tag: 'ft_${widget.id}');
     });
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -118,18 +139,41 @@ class _FileManagerPageState extends State<FileManagerPage>
   bool get wantKeepAlive => true;
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      jobController.jobTable.refresh();
+    }
+  }
+
+  Widget willPopScope(Widget child) {
+    if (isWeb) {
+      return WillPopScope(
+        onWillPop: () async {
+          clientClose(_ffi.sessionId, _ffi);
+          return false;
+        },
+        child: child,
+      );
+    } else {
+      return child;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     super.build(context);
     return Overlay(key: _overlayKeyState.key, initialEntries: [
       OverlayEntry(builder: (_) {
-        return Scaffold(
+        return willPopScope(Scaffold(
           backgroundColor: Theme.of(context).scaffoldBackgroundColor,
           body: Row(
             children: [
-              Flexible(
-                  flex: 3,
-                  child: dropArea(FileManagerView(
-                      model.localController, _ffi, _mouseFocusScope))),
+              if (!isWeb)
+                Flexible(
+                    flex: 3,
+                    child: dropArea(FileManagerView(
+                        model.localController, _ffi, _mouseFocusScope))),
               Flexible(
                   flex: 3,
                   child: dropArea(FileManagerView(
@@ -137,7 +181,7 @@ class _FileManagerPageState extends State<FileManagerPage>
               Flexible(flex: 2, child: statusList())
             ],
           ),
-        );
+        ));
       })
     ]);
   }
@@ -170,10 +214,31 @@ class _FileManagerPageState extends State<FileManagerPage>
   /// transfer status list
   /// watch transfer status
   Widget statusList() {
+    Widget getIcon(JobProgress job) {
+      final color = Theme.of(context).tabBarTheme.labelColor;
+      switch (job.type) {
+        case JobType.deleteDir:
+        case JobType.deleteFile:
+          return Icon(Icons.delete_outline, color: color);
+        default:
+          return Transform.rotate(
+            angle: isWeb
+                ? job.isRemoteToLocal
+                    ? pi / 2
+                    : pi / 2 * 3
+                : job.isRemoteToLocal
+                    ? pi
+                    : 0,
+            child: Icon(Icons.arrow_forward_ios, color: color),
+          );
+      }
+    }
+
     statusListView(List<JobProgress> jobs) => ListView.builder(
           controller: ScrollController(),
           itemBuilder: (BuildContext context, int index) {
             final item = jobs[index];
+            final status = item.getStatus();
             return Padding(
               padding: const EdgeInsets.only(bottom: 5),
               child: generateCard(
@@ -183,15 +248,8 @@ class _FileManagerPageState extends State<FileManagerPage>
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.center,
                       children: [
-                        Transform.rotate(
-                          angle: item.isRemoteToLocal ? pi : 0,
-                          child: SvgPicture.asset("assets/arrow.svg",
-                              colorFilter: svgColor(
-                                  Theme.of(context).tabBarTheme.labelColor)),
-                        ).paddingOnly(left: 15),
-                        const SizedBox(
-                          width: 16.0,
-                        ),
+                        getIcon(item)
+                            .marginSymmetric(horizontal: 10, vertical: 12),
                         Expanded(
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
@@ -200,55 +258,68 @@ class _FileManagerPageState extends State<FileManagerPage>
                               Tooltip(
                                 waitDuration: Duration(milliseconds: 500),
                                 message: item.jobName,
-                                child: Text(
-                                  item.fileName,
+                                child: ExtendedText(
+                                  item.jobName,
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
-                                ).paddingSymmetric(vertical: 10),
-                              ),
-                              Text(
-                                '${translate("Total")} ${readableFileSize(item.totalSize.toDouble())}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: MyTheme.darkGray,
+                                  overflowWidget: TextOverflowWidget(
+                                      child: Text("..."),
+                                      position: TextOverflowPosition.start),
                                 ),
                               ),
-                              Offstage(
-                                offstage: item.state != JobState.inProgress,
-                                child: Text(
-                                  '${translate("Speed")} ${readableFileSize(item.speed)}/s',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: MyTheme.darkGray,
-                                  ),
-                                ),
+                              Tooltip(
+                                waitDuration: Duration(milliseconds: 500),
+                                message: status,
+                                child: Text(status,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: MyTheme.darkGray,
+                                    )).marginOnly(top: 6),
                               ),
                               Offstage(
-                                offstage: item.state == JobState.inProgress,
-                                child: Text(
-                                  translate(
-                                    item.display(),
-                                  ),
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    color: MyTheme.darkGray,
-                                  ),
-                                ),
-                              ),
-                              Offstage(
-                                offstage: item.state != JobState.inProgress,
+                                offstage: item.type != JobType.transfer ||
+                                    item.state != JobState.inProgress,
                                 child: LinearPercentIndicator(
-                                  padding: EdgeInsets.only(right: 15),
                                   animateFromLastPercent: true,
-                                  center: Text(
-                                    '${(item.finishedSize / item.totalSize * 100).toStringAsFixed(0)}%',
+                                  center: SizedBox.expand(
+                                    child: ShaderMask(
+                                      blendMode: BlendMode.srcATop,
+                                      shaderCallback: (bounds) =>
+                                          LinearGradient(
+                                        colors: [
+                                          Colors.white,
+                                          Colors.transparent,
+                                        ],
+                                        stops: [item.percent, item.percent],
+                                      ).createShader(bounds),
+                                      child: FittedBox(
+                                        fit: BoxFit.scaleDown,
+                                        child: Text.rich(
+                                          TextSpan(
+                                            text: item.percentText,
+                                            children: [
+                                              if (item.recvJobRes)
+                                                TextSpan(
+                                                  text:
+                                                      ' ${readableFileSize(item.speed)}/s',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w300,
+                                                    color: MyTheme.darkGray,
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
                                   ),
                                   barRadius: Radius.circular(15),
-                                  percent: item.finishedSize / item.totalSize,
+                                  percent: item.percent,
                                   progressColor: MyTheme.accent,
                                   backgroundColor: Theme.of(context).hoverColor,
                                   lineHeight: kDesktopFileTransferRowHeight,
-                                ).paddingSymmetric(vertical: 15),
+                                ).paddingSymmetric(vertical: 8),
                               ),
                             ],
                           ),
@@ -259,6 +330,7 @@ class _FileManagerPageState extends State<FileManagerPage>
                             Offstage(
                               offstage: item.state != JobState.paused,
                               child: MenuButton(
+                                tooltip: translate("Resume"),
                                 onPressed: () {
                                   jobController.resumeJob(item.id);
                                 },
@@ -271,7 +343,7 @@ class _FileManagerPageState extends State<FileManagerPage>
                               ),
                             ),
                             MenuButton(
-                              padding: EdgeInsets.only(right: 15),
+                              tooltip: translate("Delete"),
                               child: SvgPicture.asset(
                                 "assets/close.svg",
                                 colorFilter: svgColor(Colors.white),
@@ -284,11 +356,11 @@ class _FileManagerPageState extends State<FileManagerPage>
                               hoverColor: MyTheme.accent80,
                             ),
                           ],
-                        ),
+                        ).marginAll(12),
                       ],
                     ),
                   ],
-                ).paddingSymmetric(vertical: 10),
+                ),
               ),
             );
           },
@@ -428,7 +500,12 @@ class _FileManagerViewState extends State<FileManagerView> {
                   },
                   onExit: (evt) =>
                       widget._mouseFocusScope.value = MouseFocusScope.none,
-                  child: _buildFileList(context, _fileListScrollController),
+                  child: Focus(
+                    canRequestFocus: false,
+                    skipTraversal: true,
+                    onKeyEvent: _onFileListKeyEvent,
+                    child: _buildFileList(context, _fileListScrollController),
+                  ),
                 ))
               ],
             ),
@@ -472,6 +549,9 @@ class _FileManagerViewState extends State<FileManagerView> {
   }
 
   Widget headTools() {
+    var uploadButtonTapPosition = RelativeRect.fill;
+    RxBool isUploadFolder =
+        (bind.mainGetLocalOption(key: 'upload-folder-button') == 'Y').obs;
     return Container(
       child: Column(
         children: [
@@ -518,6 +598,7 @@ class _FileManagerViewState extends State<FileManagerView> {
               Row(
                 children: [
                   MenuButton(
+                    tooltip: translate('Back'),
                     padding: EdgeInsets.only(
                       right: 3,
                     ),
@@ -537,6 +618,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                     },
                   ),
                   MenuButton(
+                    tooltip: translate('Parent directory'),
                     child: RotatedBox(
                       quarterTurns: 3,
                       child: SvgPicture.asset(
@@ -601,6 +683,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                 switch (_locationStatus.value) {
                   case LocationStatus.bread:
                     return MenuButton(
+                      tooltip: translate('Search'),
                       onPressed: () {
                         _locationStatus.value = LocationStatus.fileSearchBar;
                         Future.delayed(
@@ -627,6 +710,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                     );
                   case LocationStatus.fileSearchBar:
                     return MenuButton(
+                      tooltip: translate('Clear'),
                       onPressed: () {
                         onSearchText("", isLocal);
                         _locationStatus.value = LocationStatus.bread;
@@ -642,6 +726,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                 }
               }),
               MenuButton(
+                tooltip: translate('Refresh File'),
                 padding: EdgeInsets.only(
                   left: 3,
                 ),
@@ -667,6 +752,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                       isLocal ? MainAxisAlignment.start : MainAxisAlignment.end,
                   children: [
                     MenuButton(
+                      tooltip: translate('Home'),
                       padding: EdgeInsets.only(
                         right: 3,
                       ),
@@ -682,11 +768,27 @@ class _FileManagerViewState extends State<FileManagerView> {
                       hoverColor: Theme.of(context).hoverColor,
                     ),
                     MenuButton(
+                      tooltip: translate('Create Folder'),
                       onPressed: () {
                         final name = TextEditingController();
+                        String? errorText;
                         _ffi.dialogManager.show((setState, close, context) {
+                          name.addListener(() {
+                            if (errorText != null) {
+                              setState(() {
+                                errorText = null;
+                              });
+                            }
+                          });
                           submit() {
                             if (name.value.text.isNotEmpty) {
+                              if (!PathUtil.validName(name.value.text,
+                                  controller.options.value.isWindows)) {
+                                setState(() {
+                                  errorText = translate("Invalid folder name");
+                                });
+                                return;
+                              }
                               controller.createDir(PathUtil.join(
                                 controller.directory.value.path,
                                 name.value.text,
@@ -718,10 +820,11 @@ class _FileManagerViewState extends State<FileManagerView> {
                                     labelText: translate(
                                       "Please enter the folder name",
                                     ),
+                                    errorText: errorText,
                                   ),
                                   controller: name,
                                   autofocus: true,
-                                ),
+                                ).workaroundFreezeLinuxMint(),
                               ],
                             ),
                             actions: [
@@ -751,6 +854,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                       hoverColor: Theme.of(context).hoverColor,
                     ),
                     Obx(() => MenuButton(
+                          tooltip: translate('Delete'),
                           onPressed: SelectedItems.valid(selectedItems.items)
                               ? () async {
                                   await (controller
@@ -770,6 +874,66 @@ class _FileManagerViewState extends State<FileManagerView> {
                   ],
                 ),
               ),
+              if (isWeb)
+                Obx(() => ElevatedButton.icon(
+                      style: ButtonStyle(
+                        padding: MaterialStateProperty.all<EdgeInsetsGeometry>(
+                            isLocal
+                                ? EdgeInsets.only(left: 10)
+                                : EdgeInsets.only(right: 10)),
+                        backgroundColor: MaterialStateProperty.all(
+                          selectedItems.items.isEmpty
+                              ? MyTheme.accent80
+                              : MyTheme.accent,
+                        ),
+                      ),
+                      onPressed: () =>
+                          {webselectFiles(is_folder: isUploadFolder.value)},
+                      label: InkWell(
+                        hoverColor: Colors.transparent,
+                        splashColor: Colors.transparent,
+                        highlightColor: Colors.transparent,
+                        focusColor: Colors.transparent,
+                        onTapDown: (e) {
+                          final x = e.globalPosition.dx;
+                          final y = e.globalPosition.dy;
+                          uploadButtonTapPosition =
+                              RelativeRect.fromLTRB(x, y, x, y);
+                        },
+                        onTap: () async {
+                          final value = await showMenu<bool>(
+                              context: context,
+                              position: uploadButtonTapPosition,
+                              items: [
+                                PopupMenuItem<bool>(
+                                  value: false,
+                                  child: Text(translate('Upload files')),
+                                ),
+                                PopupMenuItem<bool>(
+                                  value: true,
+                                  child: Text(translate('Upload folder')),
+                                ),
+                              ]);
+                          if (value != null) {
+                            isUploadFolder.value = value;
+                            bind.mainSetLocalOption(
+                                key: 'upload-folder-button',
+                                value: value ? 'Y' : '');
+                            webselectFiles(is_folder: value);
+                          }
+                        },
+                        child: Icon(Icons.arrow_drop_down),
+                      ),
+                      icon: Text(
+                        translate(isUploadFolder.isTrue
+                            ? 'Upload folder'
+                            : 'Upload files'),
+                        textAlign: TextAlign.right,
+                        style: TextStyle(
+                          color: Colors.white,
+                        ),
+                      ).marginOnly(left: 8),
+                    )).marginOnly(left: 16),
               Obx(() => ElevatedButton.icon(
                     style: ButtonStyle(
                       padding: MaterialStateProperty.all<EdgeInsetsGeometry>(
@@ -803,19 +967,22 @@ class _FileManagerViewState extends State<FileManagerView> {
                                   : Colors.white,
                             ),
                           )
-                        : RotatedBox(
-                            quarterTurns: 2,
-                            child: SvgPicture.asset(
-                              "assets/arrow.svg",
-                              colorFilter: svgColor(selectedItems.items.isEmpty
-                                  ? Theme.of(context).brightness ==
-                                          Brightness.light
-                                      ? MyTheme.grayBg
-                                      : MyTheme.darkGray
-                                  : Colors.white),
-                              alignment: Alignment.bottomRight,
-                            ),
-                          ),
+                        : isWeb
+                            ? Offstage()
+                            : RotatedBox(
+                                quarterTurns: 2,
+                                child: SvgPicture.asset(
+                                  "assets/arrow.svg",
+                                  colorFilter: svgColor(
+                                      selectedItems.items.isEmpty
+                                          ? Theme.of(context).brightness ==
+                                                  Brightness.light
+                                              ? MyTheme.grayBg
+                                              : MyTheme.darkGray
+                                          : Colors.white),
+                                  alignment: Alignment.bottomRight,
+                                ),
+                              ),
                     label: isLocal
                         ? SvgPicture.asset(
                             "assets/arrow.svg",
@@ -827,7 +994,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                                 : Colors.white),
                           )
                         : Text(
-                            translate('Receive'),
+                            translate(isWeb ? 'Download' : 'Receive'),
                             style: TextStyle(
                               color: selectedItems.items.isEmpty
                                   ? Theme.of(context).brightness ==
@@ -882,6 +1049,7 @@ class _FileManagerViewState extends State<FileManagerView> {
         menuPos = RelativeRect.fromLTRB(x, y, x, y);
       },
       child: MenuButton(
+        tooltip: translate('More'),
         onPressed: () => mod_menu.showMenu(
           context: context,
           position: menuPos,
@@ -913,6 +1081,7 @@ class _FileManagerViewState extends State<FileManagerView> {
       BuildContext context, ScrollController scrollController) {
     final fd = controller.directory.value;
     final entries = fd.entries;
+    Rx<Entry?> rightClickEntry = Rx(null);
 
     return ListSearchActionListener(
       node: _keyboardNode,
@@ -965,22 +1134,78 @@ class _FileManagerViewState extends State<FileManagerView> {
                 return element.name.contains(_searchText.value);
               }).toList(growable: false)
             : entries;
+        // Keep rows lazy so large directories only build visible list items.
         final rows = filteredEntries.map((entry) {
           final sizeStr =
               entry.isFile ? readableFileSize(entry.size.toDouble()) : "";
           final lastModifiedStr = entry.isDrive
               ? " "
               : "${entry.lastModified().toString().replaceAll(".000", "")}   ";
+          var secondaryPosition = RelativeRect.fromLTRB(0, 0, 0, 0);
+          onTap() {
+            _keyboardNode.requestFocus();
+            final items = selectedItems;
+            // handle double click
+            if (_checkDoubleClick(entry)) {
+              controller.openDirectory(entry.path);
+              items.clear();
+              return;
+            }
+            _onSelectedChanged(items, filteredEntries, entry, isLocal);
+          }
+
+          onSecondaryTap() {
+            final items = [
+              if (!entry.isDrive &&
+                  versionCmp(_ffi.ffiModel.pi.version, "1.3.0") >= 0)
+                mod_menu.PopupMenuItem(
+                  child: Text(translate("Rename")),
+                  height: CustomPopupMenuTheme.height,
+                  onTap: () {
+                    controller.renameAction(entry, isLocal);
+                  },
+                )
+            ];
+            if (items.isNotEmpty) {
+              rightClickEntry.value = entry;
+              final future = mod_menu.showMenu(
+                context: context,
+                position: secondaryPosition,
+                items: items,
+              );
+              future.then((value) {
+                rightClickEntry.value = null;
+              });
+              future.onError((error, stackTrace) {
+                rightClickEntry.value = null;
+              });
+            }
+          }
+
+          onSecondaryTapDown(details) {
+            secondaryPosition = RelativeRect.fromLTRB(
+                details.globalPosition.dx,
+                details.globalPosition.dy,
+                details.globalPosition.dx,
+                details.globalPosition.dy);
+          }
+
           return Padding(
             padding: EdgeInsets.symmetric(vertical: 1),
             child: Obx(() => Container(
                 decoration: BoxDecoration(
                   color: selectedItems.items.contains(entry)
-                      ? Theme.of(context).hoverColor
+                      ? MyTheme.button
                       : Theme.of(context).cardColor,
                   borderRadius: BorderRadius.all(
                     Radius.circular(5.0),
                   ),
+                  border: rightClickEntry.value == entry
+                      ? Border.all(
+                          color: MyTheme.button,
+                          width: 1.0,
+                        )
+                      : null,
                 ),
                 key: ValueKey(entry.name),
                 height: kDesktopFileTransferRowHeight,
@@ -1019,22 +1244,19 @@ class _FileManagerViewState extends State<FileManagerView> {
                                               ),
                                         Expanded(
                                             child: Text(entry.name.nonBreaking,
+                                                style: TextStyle(
+                                                    color: selectedItems.items
+                                                            .contains(entry)
+                                                        ? Colors.white
+                                                        : null),
                                                 overflow:
                                                     TextOverflow.ellipsis))
                                       ]),
                                     )),
                               ),
-                              onTap: () {
-                                final items = selectedItems;
-                                // handle double click
-                                if (_checkDoubleClick(entry)) {
-                                  controller.openDirectory(entry.path);
-                                  items.clear();
-                                  return;
-                                }
-                                _onSelectedChanged(
-                                    items, filteredEntries, entry, isLocal);
-                              },
+                              onTap: onTap,
+                              onSecondaryTap: onSecondaryTap,
+                              onSecondaryTapDown: onSecondaryTapDown,
                             ),
                             SizedBox(
                               width: 2.0,
@@ -1051,11 +1273,17 @@ class _FileManagerViewState extends State<FileManagerView> {
                                         overflow: TextOverflow.ellipsis,
                                         style: TextStyle(
                                           fontSize: 12,
-                                          color: MyTheme.darkGray,
+                                          color: selectedItems.items
+                                                  .contains(entry)
+                                              ? Colors.white70
+                                              : MyTheme.darkGray,
                                         ),
                                       )),
                                 ),
                               ),
+                              onTap: onTap,
+                              onSecondaryTap: onSecondaryTap,
+                              onSecondaryTapDown: onSecondaryTapDown,
                             ),
                             // Divider from header.
                             SizedBox(
@@ -1071,9 +1299,16 @@ class _FileManagerViewState extends State<FileManagerView> {
                                     sizeStr,
                                     overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
-                                        fontSize: 10, color: MyTheme.darkGray),
+                                        fontSize: 10,
+                                        color:
+                                            selectedItems.items.contains(entry)
+                                                ? Colors.white70
+                                                : MyTheme.darkGray),
                                   ),
                                 ),
+                                onTap: onTap,
+                                onSecondaryTap: onSecondaryTap,
+                                onSecondaryTapDown: onSecondaryTapDown,
                               ),
                             ),
                           ],
@@ -1083,7 +1318,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                   ],
                 ))),
           );
-        }).toList(growable: false);
+        });
 
         return Column(
           children: [
@@ -1099,7 +1334,7 @@ class _FileManagerViewState extends State<FileManagerView> {
                 controller: scrollController,
                 itemExtent: kDesktopFileTransferRowHeight,
                 itemBuilder: (context, index) {
-                  return rows[index];
+                  return rows.elementAt(index);
                 },
                 itemCount: rows.length,
               ),
@@ -1135,6 +1370,102 @@ class _FileManagerViewState extends State<FileManagerView> {
     scrollController.jumpTo(offset);
     selectedEntries.add(searchResult.first);
     debugPrint("focused on ${searchResult.first.name}");
+  }
+
+  KeyEventResult _onFileListKeyEvent(FocusNode node, KeyEvent event) {
+    // A focused child such as a sort header keeps its default keys, e.g.
+    // Enter to sort.
+    if (!_keyboardNode.hasPrimaryFocus) return KeyEventResult.ignored;
+    for (final binding in _fileListKeyBindings().entries) {
+      if (binding.key.accepts(event, HardwareKeyboard.instance)) {
+        binding.value();
+        return KeyEventResult.handled;
+      }
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Map<ShortcutActivator, VoidCallback> _fileListKeyBindings() {
+    int all() => controller.directory.value.entries.length;
+    return {
+      const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
+          _moveSelectionByKey(-1, false),
+      const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
+          _moveSelectionByKey(1, false),
+      const SingleActivator(LogicalKeyboardKey.arrowUp, shift: true): () =>
+          _moveSelectionByKey(-1, true),
+      const SingleActivator(LogicalKeyboardKey.arrowDown, shift: true): () =>
+          _moveSelectionByKey(1, true),
+      // Unhandled, they would move keyboard focus to the other pane.
+      const SingleActivator(LogicalKeyboardKey.arrowLeft): () {},
+      const SingleActivator(LogicalKeyboardKey.arrowRight): () {},
+      const SingleActivator(LogicalKeyboardKey.pageUp): () =>
+          _moveSelectionByKey(_pageDelta(false), false),
+      const SingleActivator(LogicalKeyboardKey.pageDown): () =>
+          _moveSelectionByKey(_pageDelta(true), false),
+      const SingleActivator(LogicalKeyboardKey.home): () =>
+          _moveSelectionByKey(-all(), false),
+      const SingleActivator(LogicalKeyboardKey.end): () =>
+          _moveSelectionByKey(all(), false),
+      const SingleActivator(LogicalKeyboardKey.pageUp, shift: true): () =>
+          _moveSelectionByKey(_pageDelta(false), true),
+      const SingleActivator(LogicalKeyboardKey.pageDown, shift: true): () =>
+          _moveSelectionByKey(_pageDelta(true), true),
+      const SingleActivator(LogicalKeyboardKey.home, shift: true): () =>
+          _moveSelectionByKey(-all(), true),
+      const SingleActivator(LogicalKeyboardKey.end, shift: true): () =>
+          _moveSelectionByKey(all(), true),
+      const SingleActivator(LogicalKeyboardKey.enter): _openSelectedDirectory,
+      const SingleActivator(LogicalKeyboardKey.numpadEnter):
+          _openSelectedDirectory,
+    };
+  }
+
+  void _openSelectedDirectory() {
+    final items = selectedItems.items;
+    if (items.length != 1 || items.first.isFile) return;
+    controller.openDirectory(items.first.path);
+    selectedItems.clear();
+  }
+
+  List<Entry> _filteredEntries() {
+    final entries = controller.directory.value.entries;
+    return _searchText.isNotEmpty
+        ? entries.where((element) {
+            return element.name.contains(_searchText.value);
+          }).toList(growable: false)
+        : entries;
+  }
+
+  int _pageDelta(bool down) {
+    final entries = _filteredEntries();
+    final items = selectedItems.items;
+    final index = items.isEmpty ? -1 : entries.indexOf(items.last);
+    final position = _fileListScrollController.position;
+    final first = (position.pixels / kDesktopFileTransferRowHeight).ceil();
+    final last = ((position.pixels + position.viewportDimension) /
+                kDesktopFileTransferRowHeight)
+            .floor() -
+        1;
+    return pageDelta(
+        index >= 0 ? index : (down ? -1 : entries.length), first, last, down);
+  }
+
+  void _moveSelectionByKey(int delta, bool extend) {
+    final filteredEntries = _filteredEntries();
+    final selection =
+        navigateSelection(filteredEntries, selectedItems.items, delta, extend);
+    if (selection.isEmpty) return;
+    selectedItems.items.assignAll(selection.where((e) => !e.isDrive));
+    final position = _fileListScrollController.position;
+    final top =
+        filteredEntries.indexOf(selection.last) * kDesktopFileTransferRowHeight;
+    final bottom = top + kDesktopFileTransferRowHeight;
+    if (top < position.pixels) {
+      _fileListScrollController.jumpTo(top);
+    } else if (bottom > position.pixels + position.viewportDimension) {
+      _fileListScrollController.jumpTo(bottom - position.viewportDimension);
+    }
   }
 
   void _onSelectedChanged(SelectedItems selectedItems, List<Entry> entries,
@@ -1480,7 +1811,7 @@ class _FileManagerViewState extends State<FileManagerView> {
             onChanged: _locationStatus.value == LocationStatus.fileSearchBar
                 ? (searchText) => onSearchText(searchText, isLocal)
                 : null,
-          ),
+          ).workaroundFreezeLinuxMint(),
         )
       ],
     );
@@ -1489,6 +1820,36 @@ class _FileManagerViewState extends State<FileManagerView> {
   // openDirectory(String path, {bool isLocal = false}) {
   //   model.openDirectory(path, isLocal: isLocal);
   // }
+}
+
+/// Selection after a navigation key moves it by [delta] rows. A shift range is
+/// returned ordered from its anchor to the moved end, so the first and last
+/// items of [selected] stand for those two ends on the next press without
+/// separate state.
+@visibleForTesting
+List<Entry> navigateSelection(
+    List<Entry> entries, List<Entry> selected, int delta, bool extend) {
+  if (entries.isEmpty) return [];
+  final current = selected.isEmpty ? -1 : entries.indexOf(selected.last);
+  // With nothing selected, moving down starts above the first row and moving
+  // up below the last one, as the Sciter grid did.
+  final lead = current >= 0 ? current : (delta > 0 ? -1 : entries.length);
+  final next = (lead + delta).clamp(0, entries.length - 1);
+  if (!extend || current < 0) return [entries[next]];
+  final first = entries.indexOf(selected.first);
+  final anchor = first < 0 ? current : first;
+  final step = next < anchor ? -1 : 1;
+  return [for (var i = anchor; i != next + step; i += step) entries[i]];
+}
+
+/// Rows a PageUp/PageDown press moves from [lead] while rows [first]..[last]
+/// are fully visible: to that edge first, then a page further, as list views
+/// do.
+@visibleForTesting
+int pageDelta(int lead, int first, int last, bool down) {
+  final page = max(1, last - first);
+  if (down) return lead < last ? last - lead : page;
+  return lead > first ? first - lead : -page;
 }
 
 Widget buildWindowsThisPC(BuildContext context, [TextStyle? textStyle]) {

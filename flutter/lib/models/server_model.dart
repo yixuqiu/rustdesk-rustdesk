@@ -4,10 +4,10 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/main.dart';
+import 'package:flutter_hbb/mobile/pages/settings_page.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../common.dart';
@@ -15,6 +15,8 @@ import '../common/formatter/id_formatter.dart';
 import '../desktop/pages/server_page.dart' as desktop;
 import '../desktop/widgets/tabbar_widget.dart';
 import '../mobile/pages/server_page.dart';
+import '../mobile/widgets/android_file_transfer_setup.dart';
+import '../utils/android_documents.dart';
 import 'model.dart';
 
 const kLoginDialogTag = "LOGIN";
@@ -29,11 +31,13 @@ class ServerModel with ChangeNotifier {
   bool _inputOk = false;
   bool _audioOk = false;
   bool _fileOk = false;
+  bool _clipboardOk = false;
   bool _showElevation = false;
   bool hideCm = false;
   int _connectStatus = 0; // Rendezvous Server status
   String _verificationMethod = "";
   String _temporaryPasswordLength = "";
+  bool _allowNumericOneTimePassword = false;
   String _approveMode = "";
   int _zeroClientLengthCounter = 0;
 
@@ -48,6 +52,8 @@ class ServerModel with ChangeNotifier {
 
   Timer? cmHiddenTimer;
 
+  final _wakelockKey = UniqueKey();
+
   bool get isStart => _isStart;
 
   bool get mediaOk => _mediaOk;
@@ -57,6 +63,8 @@ class ServerModel with ChangeNotifier {
   bool get audioOk => _audioOk;
 
   bool get fileOk => _fileOk;
+
+  bool get clipboardOk => _clipboardOk;
 
   bool get showElevation => _showElevation;
 
@@ -77,7 +85,7 @@ class ServerModel with ChangeNotifier {
   String get approveMode => _approveMode;
 
   setVerificationMethod(String method) async {
-    await bind.mainSetOption(key: "verification-method", value: method);
+    await bind.mainSetOption(key: kOptionVerificationMethod, value: method);
     /*
     if (method != kUsePermanentPassword) {
       await bind.mainSetOption(
@@ -99,13 +107,19 @@ class ServerModel with ChangeNotifier {
   }
 
   setApproveMode(String mode) async {
-    await bind.mainSetOption(key: 'approve-mode', value: mode);
+    await bind.mainSetOption(key: kOptionApproveMode, value: mode);
     /*
     if (mode != 'password') {
       await bind.mainSetOption(
           key: 'allow-hide-cm', value: bool2option('allow-hide-cm', false));
     }
     */
+  }
+
+  bool get allowNumericOneTimePassword => _allowNumericOneTimePassword;
+  switchAllowNumericOneTimePassword() async {
+    await mainSetBoolOption(
+        kOptionAllowNumericOneTimePassword, !_allowNumericOneTimePassword);
   }
 
   TextEditingController get serverId => _serverId;
@@ -125,8 +139,8 @@ class ServerModel with ChangeNotifier {
     /*
     // initital _hideCm at startup
     final verificationMethod =
-        bind.mainGetOptionSync(key: "verification-method");
-    final approveMode = bind.mainGetOptionSync(key: 'approve-mode');
+        bind.mainGetOptionSync(key: kOptionVerificationMethod);
+    final approveMode = bind.mainGetOptionSync(key: kOptionApproveMode);
     _hideCm = option2bool(
         'allow-hide-cm', bind.mainGetOptionSync(key: 'allow-hide-cm'));
     if (!(approveMode == 'password' &&
@@ -176,6 +190,11 @@ class ServerModel with ChangeNotifier {
         await timerCallback();
       });
     }
+
+    // Initial keyboard status is off on mobile
+    if (isMobile) {
+      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+    }
   }
 
   /// 1. check android permission
@@ -187,20 +206,20 @@ class ServerModel with ChangeNotifier {
     if (androidVersion < 30 ||
         !await AndroidPermissionManager.check(kRecordAudio)) {
       _audioOk = false;
-      bind.mainSetOption(key: "enable-audio", value: "N");
+      bind.mainSetOption(key: kOptionEnableAudio, value: "N");
     } else {
-      final audioOption = await bind.mainGetOption(key: 'enable-audio');
-      _audioOk = audioOption.isEmpty;
+      final audioOption = await bind.mainGetOption(key: kOptionEnableAudio);
+      _audioOk = audioOption != 'N';
     }
 
-    // file
-    if (!await AndroidPermissionManager.check(kManageExternalStorage)) {
-      _fileOk = false;
-      bind.mainSetOption(key: "enable-file-transfer", value: "N");
-    } else {
-      final fileOption = await bind.mainGetOption(key: 'enable-file-transfer');
-      _fileOk = fileOption.isEmpty;
-    }
+    // Android file transfer is confined to app-specific storage. Files enter
+    // and leave the workspace through Android's system document picker.
+    final fileOption = await bind.mainGetOption(key: kOptionEnableFileTransfer);
+    _fileOk = fileOption != 'N';
+
+    // clipboard
+    final clipOption = await bind.mainGetOption(key: kOptionEnableClipboard);
+    _clipboardOk = clipOption != 'N';
 
     notifyListeners();
   }
@@ -209,10 +228,12 @@ class ServerModel with ChangeNotifier {
     var update = false;
     final temporaryPassword = await bind.mainGetTemporaryPassword();
     final verificationMethod =
-        await bind.mainGetOption(key: "verification-method");
+        await bind.mainGetOption(key: kOptionVerificationMethod);
     final temporaryPasswordLength =
         await bind.mainGetOption(key: "temporary-password-length");
-    final approveMode = await bind.mainGetOption(key: 'approve-mode');
+    final approveMode = await bind.mainGetOption(key: kOptionApproveMode);
+    final numericOneTimePassword =
+        await mainGetBoolOption(kOptionAllowNumericOneTimePassword);
     /*
     var hideCm = option2bool(
         'allow-hide-cm', await bind.mainGetOption(key: 'allow-hide-cm'));
@@ -225,8 +246,7 @@ class ServerModel with ChangeNotifier {
       _approveMode = approveMode;
       update = true;
     }
-    var stopped = option2bool(
-        "stop-service", await bind.mainGetOption(key: "stop-service"));
+    var stopped = await mainGetBoolOption(kOptionStopService);
     final oldPwdText = _serverPasswd.text;
     if (stopped ||
         verificationMethod == kUsePermanentPassword ||
@@ -252,6 +272,10 @@ class ServerModel with ChangeNotifier {
       _temporaryPasswordLength = temporaryPasswordLength;
       update = true;
     }
+    if (_allowNumericOneTimePassword != numericOneTimePassword) {
+      _allowNumericOneTimePassword = numericOneTimePassword;
+      update = true;
+    }
     /*
     if (_hideCm != hideCm) {
       _hideCm = hideCm;
@@ -271,7 +295,7 @@ class ServerModel with ChangeNotifier {
   }
 
   toggleAudio() async {
-    if (clients.isNotEmpty) {
+    if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
     }
     if (!_audioOk && !await AndroidPermissionManager.check(kRecordAudio)) {
@@ -283,36 +307,37 @@ class ServerModel with ChangeNotifier {
     }
 
     _audioOk = !_audioOk;
-    bind.mainSetOption(key: "enable-audio", value: _audioOk ? '' : 'N');
+    bind.mainSetOption(
+        key: kOptionEnableAudio, value: _audioOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
   toggleFile() async {
-    if (clients.isNotEmpty) {
+    if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
     }
-    if (!_fileOk &&
-        !await AndroidPermissionManager.check(kManageExternalStorage)) {
-      final res =
-          await AndroidPermissionManager.request(kManageExternalStorage);
-      if (!res) {
-        showToast(translate('Failed'));
-        return;
-      }
-    }
-
     _fileOk = !_fileOk;
-    bind.mainSetOption(key: "enable-file-transfer", value: _fileOk ? '' : 'N');
+    bind.mainSetOption(
+        key: kOptionEnableFileTransfer,
+        value: _fileOk ? defaultOptionYes : 'N');
+    notifyListeners();
+  }
+
+  toggleClipboard() async {
+    _clipboardOk = !clipboardOk;
+    bind.mainSetOption(
+        key: kOptionEnableClipboard,
+        value: clipboardOk ? defaultOptionYes : 'N');
     notifyListeners();
   }
 
   toggleInput() async {
-    if (clients.isNotEmpty) {
+    if (clients.any((c) => !c.disconnected)) {
       await showClientsMayNotBeChangedAlert(parent.target);
     }
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
-      bind.mainSetOption(key: "enable-keyboard", value: 'N');
+      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
     } else {
       if (parent.target != null) {
         /// the result of toggle-on depends on user actions in the settings page.
@@ -333,6 +358,20 @@ class ServerModel with ChangeNotifier {
     }
     var res = await AndroidPermissionManager.request(kAndroid13Notification);
     debugPrint("notification permission request result: $res");
+    return res;
+  }
+
+  Future<bool> checkFloatingWindowPermission() async {
+    debugPrint("androidVersion $androidVersion");
+    if (androidVersion < 23) {
+      return false;
+    }
+    if (await AndroidPermissionManager.check(kSystemAlertWindow)) {
+      debugPrint("alert window permission already granted");
+      return true;
+    }
+    var res = await AndroidPermissionManager.request(kSystemAlertWindow);
+    debugPrint("alert window permission request result: $res");
     return res;
   }
 
@@ -362,7 +401,18 @@ class ServerModel with ChangeNotifier {
         stopService();
       }
     } else {
+      if (isAndroid) {
+        try {
+          await AndroidDocuments.requireLogFolder();
+          await showAndroidFileTransferSetup(gFFI);
+        } catch (_) {
+          debugPrint('Folder setup failed; continuing service startup');
+        }
+      }
       await checkRequestNotificationPermission();
+      if (bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) != 'Y') {
+        await checkFloatingWindowPermission();
+      }
       final res = await parent.target?.dialogManager
           .show<bool>((setState, close, context) {
         submit() => close(true);
@@ -398,7 +448,7 @@ class ServerModel with ChangeNotifier {
     await bind.mainStartService();
     updateClientState();
     if (isAndroid) {
-      WakelockPlus.enable();
+      androidUpdatekeepScreenOn();
     }
   }
 
@@ -409,21 +459,8 @@ class ServerModel with ChangeNotifier {
     await parent.target?.invokeMethod("stop_service");
     await bind.mainStopService();
     notifyListeners();
-    if (!isLinux) {
-      // current linux is not supported
-      WakelockPlus.disable();
-    }
-  }
-
-  Future<bool> setPermanentPassword(String newPW) async {
-    await bind.mainSetPermanentPassword(password: newPW);
-    await Future.delayed(Duration(milliseconds: 500));
-    final pw = await bind.mainGetPermanentPassword();
-    if (newPW == pw) {
-      return true;
-    } else {
-      return false;
-    }
+    // for androidUpdatekeepScreenOn only
+    WakelockManager.disable(_wakelockKey);
   }
 
   fetchID() async {
@@ -445,7 +482,9 @@ class ServerModel with ChangeNotifier {
         break;
       case "input":
         if (_inputOk != value) {
-          bind.mainSetOption(key: "enable-keyboard", value: value ? '' : 'N');
+          bind.mainSetOption(
+              key: kOptionEnableKeyboard,
+              value: value ? defaultOptionYes : 'N');
         }
         _inputOk = value;
         break;
@@ -489,6 +528,7 @@ class ServerModel with ChangeNotifier {
     }
     if (_clients.length != oldClientLenght) {
       notifyListeners();
+      if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
 
@@ -501,10 +541,19 @@ class ServerModel with ChangeNotifier {
         if (index < 0) {
           _clients.add(client);
         } else {
+          if (_clients[index].authorized) {
+            _clients[index].privacyMode = client.privacyMode;
+            notifyListeners();
+            return;
+          }
           _clients[index].authorized = true;
+          _clients[index].privacyMode = client.privacyMode;
         }
       } else {
-        if (_clients.any((c) => c.id == client.id)) {
+        final index = _clients.indexWhere((c) => c.id == client.id);
+        if (index >= 0) {
+          _clients[index].privacyMode = client.privacyMode;
+          notifyListeners();
           return;
         }
         _clients.add(client);
@@ -523,6 +572,7 @@ class ServerModel with ChangeNotifier {
       scrollToBottom();
       notifyListeners();
       if (isAndroid && !client.authorized) showLoginDialog(client);
+      if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
     }
@@ -550,37 +600,66 @@ class ServerModel with ChangeNotifier {
   }
 
   void showLoginDialog(Client client) {
+    showClientDialog(
+      client,
+      client.isFileTransfer
+          ? "Transfer file"
+          : client.isViewCamera
+              ? "View camera"
+              : client.isTerminal
+                  ? "Terminal"
+                  : "Share screen",
+      'Do you accept?',
+      'android_new_connection_tip',
+      () => sendLoginResponse(client, false),
+      () => sendLoginResponse(client, true),
+    );
+  }
+
+  handleVoiceCall(Client client, bool accept) {
+    parent.target?.invokeMethod("cancel_notification", client.id);
+    bind.cmHandleIncomingVoiceCall(id: client.id, accept: accept);
+  }
+
+  showVoiceCallDialog(Client client) {
+    showClientDialog(
+      client,
+      'Voice call',
+      'Do you accept?',
+      'android_new_voice_call_tip',
+      () => handleVoiceCall(client, false),
+      () => handleVoiceCall(client, true),
+    );
+  }
+
+  showClientDialog(Client client, String title, String contentTitle,
+      String content, VoidCallback onCancel, VoidCallback onSubmit) {
     parent.target?.dialogManager.show((setState, close, context) {
       cancel() {
-        sendLoginResponse(client, false);
+        onCancel();
         close();
       }
 
       submit() {
-        sendLoginResponse(client, true);
+        onSubmit();
         close();
       }
 
       return CustomAlertDialog(
         title:
             Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-          Text(translate(
-              client.isFileTransfer ? "File Connection" : "Screen Connection")),
-          IconButton(
-              onPressed: () {
-                close();
-              },
-              icon: const Icon(Icons.close))
+          Text(translate(title)),
+          IconButton(onPressed: close, icon: const Icon(Icons.close))
         ]),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(translate("Do you accept?")),
+            Text(translate(contentTitle)),
             ClientInfo(client),
             Text(
-              translate("android_new_connection_tip"),
+              translate(content),
               style: Theme.of(globalKey.currentContext!).textTheme.bodyMedium,
             ),
           ],
@@ -608,7 +687,7 @@ class ServerModel with ChangeNotifier {
   void sendLoginResponse(Client client, bool res) async {
     if (res) {
       bind.cmLoginRes(connId: client.id, res: res);
-      if (!client.isFileTransfer) {
+      if (!client.isFileTransfer && !client.isTerminal) {
         parent.target?.invokeMethod("start_capture");
       }
       parent.target?.invokeMethod("cancel_notification", client.id);
@@ -620,6 +699,7 @@ class ServerModel with ChangeNotifier {
       final index = _clients.indexOf(client);
       tabController.remove(index);
       _clients.remove(client);
+      if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
 
@@ -643,17 +723,23 @@ class ServerModel with ChangeNotifier {
       if (desktopType == DesktopType.cm && _clients.isEmpty) {
         hideCmWindow();
       }
+      if (isAndroid) androidUpdatekeepScreenOn();
       notifyListeners();
     } catch (e) {
       debugPrint("onClientRemove failed,error:$e");
     }
   }
 
-  Future<void> closeAll() async {
-    await Future.wait(
-        _clients.map((client) => bind.cmCloseConnection(connId: client.id)));
+  /// `byOperator` false means the CM's window went away rather than a person asking for the
+  /// peers to go. The sessions end either way; only the close reason differs, and with it
+  /// whether the peer is allowed to reconnect. See `ipc::Data::CmWindowClosed`.
+  Future<void> closeAll({bool byOperator = true}) async {
+    await Future.wait(_clients.map((client) => byOperator
+        ? bind.cmCloseConnection(connId: client.id)
+        : bind.cmCloseConnectionWindow(connId: client.id)));
     _clients.clear();
     tabController.state.value.tabs.clear();
+    if (isAndroid) androidUpdatekeepScreenOn();
   }
 
   void jumpTo(int id) {
@@ -676,10 +762,14 @@ class ServerModel with ChangeNotifier {
         _clients[index].inVoiceCall = client.inVoiceCall;
         _clients[index].incomingVoiceCall = client.incomingVoiceCall;
         if (client.incomingVoiceCall) {
-          // Has incoming phone call, let's set the window on top.
-          Future.delayed(Duration.zero, () {
-            windowOnTop(null);
-          });
+          if (isAndroid) {
+            showVoiceCallDialog(client);
+          } else {
+            // Has incoming phone call, let's set the window on top.
+            Future.delayed(Duration.zero, () {
+              windowOnTop(null);
+            });
+          }
         }
         notifyListeners();
       }
@@ -687,20 +777,44 @@ class ServerModel with ChangeNotifier {
       debugPrint("updateVoiceCallState failed: $e");
     }
   }
+
+  void androidUpdatekeepScreenOn() async {
+    if (!isAndroid) return;
+    var floatingWindowDisabled =
+        bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
+            !await AndroidPermissionManager.check(kSystemAlertWindow);
+    final keepScreenOn = floatingWindowDisabled
+        ? KeepScreenOn.never
+        : optionToKeepScreenOn(
+            bind.mainGetLocalOption(key: kOptionKeepScreenOn));
+    final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
+        (keepScreenOn == KeepScreenOn.duringControlled &&
+            _clients.map((e) => !e.disconnected).isNotEmpty);
+    if (on) {
+      WakelockManager.enable(_wakelockKey, isServer: true);
+    } else {
+      WakelockManager.disable(_wakelockKey);
+    }
+  }
 }
 
 enum ClientType {
   remote,
   file,
+  camera,
   portForward,
+  terminal,
 }
 
 class Client {
   int id = 0; // client connections inner count id
   bool authorized = false;
   bool isFileTransfer = false;
+  bool isViewCamera = false;
+  bool isTerminal = false;
   String portForward = "";
   String name = "";
+  String avatar = "";
   String peerId = ""; // peer user's id,show at app
   bool keyboard = false;
   bool clipboard = false;
@@ -709,6 +823,7 @@ class Client {
   bool restart = false;
   bool recording = false;
   bool blockInput = false;
+  bool privacyMode = false;
   bool disconnected = false;
   bool fromSwitch = false;
   bool inVoiceCall = false;
@@ -716,15 +831,19 @@ class Client {
 
   RxInt unreadChatMessageCount = 0.obs;
 
-  Client(this.id, this.authorized, this.isFileTransfer, this.name, this.peerId,
-      this.keyboard, this.clipboard, this.audio);
+  Client(this.id, this.authorized, this.isFileTransfer, this.isViewCamera,
+      this.name, this.peerId, this.keyboard, this.clipboard, this.audio);
 
   Client.fromJson(Map<String, dynamic> json) {
     id = json['id'];
     authorized = json['authorized'];
     isFileTransfer = json['is_file_transfer'];
+    // TODO: no entry then default.
+    isViewCamera = json['is_view_camera'];
+    isTerminal = json['is_terminal'] ?? false;
     portForward = json['port_forward'];
     name = json['name'];
+    avatar = json['avatar'] ?? '';
     peerId = json['peer_id'];
     keyboard = json['keyboard'];
     clipboard = json['clipboard'];
@@ -733,6 +852,7 @@ class Client {
     restart = json['restart'];
     recording = json['recording'];
     blockInput = json['block_input'];
+    privacyMode = json['privacy_mode'] ?? privacyMode;
     disconnected = json['disconnected'];
     fromSwitch = json['from_switch'];
     inVoiceCall = json['in_voice_call'];
@@ -742,10 +862,13 @@ class Client {
   Map<String, dynamic> toJson() {
     final Map<String, dynamic> data = <String, dynamic>{};
     data['id'] = id;
-    data['is_start'] = authorized;
+    data['authorized'] = authorized;
     data['is_file_transfer'] = isFileTransfer;
+    data['is_view_camera'] = isViewCamera;
+    data['is_terminal'] = isTerminal;
     data['port_forward'] = portForward;
     data['name'] = name;
+    data['avatar'] = avatar;
     data['peer_id'] = peerId;
     data['keyboard'] = keyboard;
     data['clipboard'] = clipboard;
@@ -754,14 +877,21 @@ class Client {
     data['restart'] = restart;
     data['recording'] = recording;
     data['block_input'] = blockInput;
+    data['privacy_mode'] = privacyMode;
     data['disconnected'] = disconnected;
     data['from_switch'] = fromSwitch;
+    data['in_voice_call'] = inVoiceCall;
+    data['incoming_voice_call'] = incomingVoiceCall;
     return data;
   }
 
   ClientType type_() {
     if (isFileTransfer) {
       return ClientType.file;
+    } else if (isViewCamera) {
+      return ClientType.camera;
+    } else if (isTerminal) {
+      return ClientType.terminal;
     } else if (portForward.isNotEmpty) {
       return ClientType.portForward;
     } else {

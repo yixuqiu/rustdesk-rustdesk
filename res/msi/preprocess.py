@@ -8,8 +8,10 @@ import argparse
 import datetime
 import subprocess
 import re
+import platform
 from pathlib import Path
 import shutil
+from xml.sax.saxutils import quoteattr
 
 g_indent_unit = "\t"
 g_version = ""
@@ -33,10 +35,12 @@ g_arpsystemcomponent = {
     },
     "ReadMe": {
         "msi": "ARPREADME",
-        "v": "https://github.com/fufesou/rustdesk",
+        "v": "https://github.com/rustdesk/rustdesk",
     },
 }
 
+def default_revision_version():
+    return int(datetime.datetime.now().timestamp() / 60)
 
 def make_parser():
     parser = argparse.ArgumentParser(description="Msi preprocess script.")
@@ -45,22 +49,36 @@ def make_parser():
         "--dist-dir",
         type=str,
         default="../../rustdesk",
-        help="The dist direcotry to install.",
+        help="The dist directory to install.",
     )
     parser.add_argument(
         "--arp",
         action="store_true",
-        help="Is ARPSYSTEMCOMPONENT",
+        help="Deprecated; native MSI ARP registration is always used.",
         default=False,
     )
     parser.add_argument(
         "--custom-arp",
         type=str,
         default="{}",
-        help='Custom arp properties, e.g. \'["Comments": {"msi": "ARPCOMMENTS", "v": "Remote control application."}]\'',
+        help='Custom arp properties, e.g. \'{"Comments": {"msi": "ARPCOMMENTS", "v": "Remote control application."}}\'',
     )
     parser.add_argument(
         "-c", "--custom", action="store_true", help="Is custom client", default=False
+    )
+    parser.add_argument(
+        "--template",
+        action="store_true",
+        default=False,
+        help="Build a template to be patched per customer rather than a finished "
+        "package: puts the files a custom client replaces in their own cabinet, so "
+        "rebranding rebuilds a few hundred KB instead of the whole payload.",
+    )
+    parser.add_argument(
+        "--conn-type",
+        type=str,
+        default="",
+        help='Connection type, e.g. "incoming", "outgoing". Default is empty, means incoming-outgoing',
     )
     parser.add_argument(
         "--app-name", type=str, default="RustDesk", help="The app name."
@@ -69,17 +87,57 @@ def make_parser():
         "-v", "--version", type=str, default="", help="The app version."
     )
     parser.add_argument(
+        "--revision-version", type=int, default=default_revision_version(), help="The revision version."
+    )
+    parser.add_argument(
         "-m",
         "--manufacturer",
         type=str,
-        default="PURSLANE",
+        default="Purslane Tech Pte. Ltd.",
         help="The app manufacturer.",
     )
     return parser
 
 
+# Files a custom client replaces. Kept in their own cabinet by --template so that
+# rebranding rebuilds a few hundred KB instead of recompressing the whole payload.
+# The app executable is handled separately: it has its own component in RustDesk.wxs.
+#
+# A template has to ship a placeholder for each of these so there is a File row to
+# patch, but the branding assets are optional for a customer and a stock build has
+# none of them at all. So each optional one installs only when its property is set,
+# which the patcher does for the files a customer actually supplied. Otherwise a
+# customer without a logo would install the placeholder, where today they get no
+# logo at all -- the client treats a missing asset as "no logo".
+PER_CUSTOMER_DISK_ID = 2
+PER_CUSTOMER_FILES = {
+    # relative path -> property gating installation, or None if always installed
+    "custom.txt": None,
+    "data/flutter_assets/assets/icon.ico": "CC_HAS_ICON_ICO",
+    "data/flutter_assets/assets/icon.png": "CC_HAS_ICON_PNG",
+    "data/flutter_assets/assets/logo.png": "CC_HAS_LOGO",
+    "data/flutter_assets/assets/logo_light.png": "CC_HAS_LOGO_LIGHT",
+    "data/flutter_assets/assets/logo_dark.png": "CC_HAS_LOGO_DARK",
+}
+
+
+def normalize_relative(relative_path):
+    path = relative_path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.lower()
+
+
+def is_per_customer(relative_path):
+    return normalize_relative(relative_path) in PER_CUSTOMER_FILES
+
+
+def per_customer_condition(relative_path):
+    return PER_CUSTOMER_FILES.get(normalize_relative(relative_path))
+
+
 def read_lines_and_start_index(file_path, tag_start, tag_end):
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     index_start = -1
     index_end = -1
@@ -98,7 +156,7 @@ def read_lines_and_start_index(file_path, tag_start, tag_end):
     return lines, index_start
 
 
-def insert_components_between_tags(lines, index_start, app_name, dist_dir):
+def insert_components_between_tags(lines, index_start, app_name, dist_dir, template=False):
     indent = g_indent_unit * 3
     path = Path(dist_dir)
     idx = 1
@@ -112,12 +170,23 @@ def insert_components_between_tags(lines, index_start, app_name, dist_dir):
             if subdir != ".":
                 dir_attr = f'Subdirectory="{subdir}"'
 
+            relative = file_path.relative_to(path).as_posix()
+            disk_attr = ""
+            condition_attr = ""
+            if template and is_per_customer(relative):
+                disk_attr = f' DiskId="{PER_CUSTOMER_DISK_ID}"'
+                # Branding assets are optional, and the template only carries a
+                # placeholder, so install one only when the customer supplied it.
+                condition = per_customer_condition(relative)
+                if condition:
+                    condition_attr = f' Condition="{condition} = 1"'
+
             # Don't generate Component Id and File Id like 'Component_{idx}' and 'File_{idx}'
             # because it will cause error
             # "Error WIX0130	The primary key 'xxxx' is duplicated in table 'Directory'"
             to_insert_lines = f"""
-{indent}<Component Guid="{uuid.uuid4()}" {dir_attr}>
-{indent}{g_indent_unit}<File Source="{file_path.as_posix()}" KeyPath="yes" Checksum="yes" />
+{indent}<Component Guid="{uuid.uuid4()}" {dir_attr}{condition_attr}>
+{indent}{g_indent_unit}<File Source="{file_path.as_posix()}" KeyPath="yes" Checksum="yes"{disk_attr} />
 {indent}</Component>
 """
             lines.insert(index_start + 1, to_insert_lines[1:])
@@ -126,15 +195,50 @@ def insert_components_between_tags(lines, index_start, app_name, dist_dir):
     return True
 
 
-def gen_auto_component(app_name, dist_dir):
+def gen_auto_component(app_name, dist_dir, template=False):
     return gen_content_between_tags(
         "Package/Components/RustDesk.wxs",
         "<!--$AutoComonentStart$-->",
         "<!--$AutoComponentEnd$-->",
         lambda lines, index_start: insert_components_between_tags(
-            lines, index_start, app_name, dist_dir
+            lines, index_start, app_name, dist_dir, template
         ),
     )
+
+
+def gen_media2():
+    """Second cabinet holding only what a custom client replaces."""
+
+    def func(lines, index_start):
+        indent = g_indent_unit * 2
+        lines.insert(
+            index_start + 1,
+            f'{indent}<Media Id="{PER_CUSTOMER_DISK_ID}" Cabinet="cab2.cab"'
+            ' EmbedCab="yes" CompressionLevel="high" />\n',
+        )
+        return lines
+
+    return gen_content_between_tags(
+        "Package/Package.wxs", "<!--$Media2Start$-->", "<!--$Media2End$-->", func
+    )
+
+
+def put_app_exe_on_media2():
+    """The app executable has its own component, so it is moved by name."""
+    target = Path(sys.argv[0]).parent.joinpath("Package/Components/RustDesk.wxs")
+    with open(target, "r", encoding="utf-8") as f:
+        content = f.read()
+    old = '<File Id="App.exe" Name="$(var.Product).exe" KeyPath="yes" Checksum="yes">'
+    new = (
+        '<File Id="App.exe" Name="$(var.Product).exe" KeyPath="yes" Checksum="yes"'
+        f' DiskId="{PER_CUSTOMER_DISK_ID}">'
+    )
+    if content.count(old) != 1:
+        print(f"Error: expected exactly one App.exe File element, found {content.count(old)}")
+        return False
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(content.replace(old, new))
+    return True
 
 
 def gen_pre_vars(args, dist_dir):
@@ -169,13 +273,12 @@ def gen_pre_vars(args, dist_dir):
 def replace_app_name_in_langs(app_name):
     langs_dir = Path(sys.argv[0]).parent.joinpath("Package/Language")
     for file_path in langs_dir.glob("*.wxl"):
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
             lines[i] = line.replace("RustDesk", app_name)
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
-
 
 def gen_upgrade_info():
     def func(lines, index_start):
@@ -234,25 +337,19 @@ def gen_custom_dialog_bitmaps():
     )
 
 
-def gen_custom_ARPSYSTEMCOMPONENT_False(args):
+def gen_native_arp_properties():
     def func(lines, index_start):
         indent = g_indent_unit * 2
 
         lines_new = []
-        lines_new.append(
-            f"{indent}<!--https://learn.microsoft.com/en-us/windows/win32/msi/arpsystemcomponent?redirectedfrom=MSDN-->\n"
-        )
-        lines_new.append(
-            f'{indent}<!--<Property Id="ARPSYSTEMCOMPONENT" Value="1" />-->\n\n'
-        )
-
         lines_new.append(
             f"{indent}<!--https://learn.microsoft.com/en-us/windows/win32/msi/property-reference-->\n"
         )
         for _, v in g_arpsystemcomponent.items():
             if "msi" in v and "v" in v:
                 lines_new.append(
-                    f'{indent}<Property Id="{v["msi"]}" Value="{v["v"]}" />\n'
+                    f'{indent}<Property Id={quoteattr(str(v["msi"]))} '
+                    f'Value={quoteattr(str(v["v"]))} />\n'
                 )
 
         for i, line in enumerate(lines_new):
@@ -267,92 +364,16 @@ def gen_custom_ARPSYSTEMCOMPONENT_False(args):
     )
 
 
-def get_folder_size(folder_path):
-    total_size = 0
-
-    folder = Path(folder_path)
-    for file in folder.glob("**/*"):
-        if file.is_file():
-            total_size += file.stat().st_size
-
-    return total_size
-
-
-def gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir):
+def gen_install_state_values():
     def func(lines, index_start):
         indent = g_indent_unit * 5
-
         lines_new = []
-        lines_new.append(
-            f"{indent}<!--https://learn.microsoft.com/en-us/windows/win32/msi/property-reference-->\n"
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="DisplayName" Value="{args.app_name}" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="DisplayIcon" Value="[INSTALLFOLDER]{args.app_name}.exe" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="DisplayVersion" Value="{g_version}" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="Publisher" Value="{args.manufacturer}" />\n'
-        )
-        installDate = datetime.datetime.now().strftime("%Y%m%d")
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="InstallDate" Value="{installDate}" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="InstallLocation" Value="[INSTALLFOLDER]" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="InstallSource" Value="[InstallSource]" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Name="Language" Value="[ProductLanguage]" />\n'
-        )
-
-        estimated_size = get_folder_size(dist_dir)
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Name="EstimatedSize" Value="{estimated_size}" />\n'
-        )
-
-        lines_new.append(
-            f'{indent}<RegistryValue Type="expandable" Name="ModifyPath" Value="MsiExec.exe /X [ProductCode]" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Id="NoModify" Value="1" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="expandable" Name="UninstallString" Value="MsiExec.exe /X [ProductCode]" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="expandable" Name="QuietUninstallString" Value="MsiExec.exe /qn /X [ProductCode]" />\n'
-        )
-
-        vs = g_version.split(".")
-        major, minor, build = vs[0], vs[1], vs[2]
-        lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="Version" Value="{g_version}" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Name="VersionMajor" Value="{major}" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Name="VersionMinor" Value="{minor}" />\n'
-        )
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Name="VersionBuild" Value="{build}" />\n'
-        )
-
-        lines_new.append(
-            f'{indent}<RegistryValue Type="integer" Name="WindowsInstaller" Value="1" />\n'
-        )
-        for k, v in g_arpsystemcomponent.items():
-            if "v" in v:
-                t = v["t"] if "t" in v is None else "string"
+        for name, value in g_arpsystemcomponent.items():
+            if "msi" not in value and "v" in value:
+                value_type = value.get("t", "string")
                 lines_new.append(
-                    f'{indent}<RegistryValue Type="{t}" Name="{k}" Value="{v["v"]}" />\n'
+                    f'{indent}<RegistryValue Type={quoteattr(str(value_type))} '
+                    f'Name={quoteattr(str(name))} Value={quoteattr(str(value["v"]))} />\n'
                 )
 
         for i, line in enumerate(lines_new):
@@ -361,25 +382,56 @@ def gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir):
 
     return gen_content_between_tags(
         "Package/Components/Regs.wxs",
-        "<!--$ArpStart$-->",
-        "<!--$ArpEnd$-->",
+        "<!--$InstallStateStart$-->",
+        "<!--$InstallStateEnd$-->",
         func,
     )
 
 
-def gen_custom_ARPSYSTEMCOMPONENT(args, dist_dir):
+def gen_custom_ARPSYSTEMCOMPONENT(args, _dist_dir):
     try:
-        custom_arp = json.loads(args.custom_arp)
-        g_arpsystemcomponent.update(custom_arp)
-    except json.JSONDecodeError as e:
+        custom_arp = dict(json.loads(args.custom_arp))
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
         print(f"Failed to decode custom arp: {e}")
         return False
 
-    if args.arp:
-        return gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir)
-    else:
-        return gen_custom_ARPSYSTEMCOMPONENT_False(args)
+    if any(not isinstance(value, dict) for value in custom_arp.values()):
+        print("Custom arp entries must be objects.")
+        return False
 
+    if any(
+        isinstance(value, dict) and value.get("msi") == "ARPSYSTEMCOMPONENT"
+        for value in custom_arp.values()
+    ):
+        print("ARPSYSTEMCOMPONENT is not allowed; native MSI ARP registration must remain visible.")
+        return False
+
+    g_arpsystemcomponent.update(custom_arp)
+
+    if not gen_native_arp_properties():
+        return False
+    return gen_install_state_values()
+
+def gen_conn_type(args):
+    def func(lines, index_start):
+        indent = g_indent_unit * 3
+
+        lines_new = []
+        if args.conn_type != "":
+            lines_new.append(
+                f"""{indent}<Property Id="CC_CONNECTION_TYPE" Value="{args.conn_type}" />\n"""
+            )
+
+        for i, line in enumerate(lines_new):
+            lines.insert(index_start + i + 1, line)
+        return lines
+
+    return gen_content_between_tags(
+        "Package/Fragments/AddRemoveProperties.wxs",
+        "<!--$CustomClientPropsStart$-->",
+        "<!--$CustomClientPropsEnd$-->",
+        func,
+    )
 
 def gen_content_between_tags(filename, tag_start, tag_end, func):
     target_file = Path(sys.argv[0]).parent.joinpath(filename)
@@ -389,7 +441,7 @@ def gen_content_between_tags(filename, tag_start, tag_end, func):
 
     func(lines, index_start)
 
-    with open(target_file, "w") as f:
+    with open(target_file, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
     return True
@@ -430,6 +482,11 @@ def init_global_vars(dist_dir, app_name, args):
     if not version_pattern.match(g_version):
         print(f"Error: version {g_version} not found in {dist_app}")
         return False
+    if g_version.count(".") == 2:
+        # https://github.com/dotnet/runtime/blob/5535e31a712343a63f5d7d796cd874e563e5ac14/src/libraries/System.Private.CoreLib/src/System/Version.cs
+        if args.revision_version < 0 or args.revision_version > 2147483647:
+            raise ValueError(f"Invalid revision version: {args.revision_version}")    
+        g_version = f"{g_version}.{args.revision_version}"
 
     g_build_date = read_process_output("--build-date")
     build_date_pattern = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
@@ -444,19 +501,19 @@ def update_license_file(app_name):
     if app_name == "RustDesk":
         return
     license_file = Path(sys.argv[0]).parent.joinpath("Package/License.rtf")
-    with open(license_file, "r") as f:
+    with open(license_file, "r", encoding="utf-8") as f:
         license_content = f.read()
     license_content = license_content.replace("website rustdesk.com and other ", "")
     license_content = license_content.replace("RustDesk", app_name)
-    license_content = re.sub("Purslane Ltd", app_name, license_content, flags=re.IGNORECASE)
-    with open(license_file, "w") as f:
+    license_content = re.sub(r"Purslane(?: Tech Pte\.)? Ltd", app_name, license_content, flags=re.IGNORECASE)
+    with open(license_file, "w", encoding="utf-8") as f:
         f.write(license_content)
 
 
 def replace_component_guids_in_wxs():
     langs_dir = Path(sys.argv[0]).parent.joinpath("Package")
     for file_path in langs_dir.glob("**/*.wxs"):
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
         # <Component Id="Product.Registry.DefaultIcon" Guid="6DBF2690-0955-4C6A-940F-634DDA503F49">
@@ -465,7 +522,7 @@ def replace_component_guids_in_wxs():
             if match:
                 lines[i] = re.sub(r'Guid="[^"]+"', f'Guid="{uuid.uuid4()}"', line)
 
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
 
@@ -496,7 +553,16 @@ if __name__ == "__main__":
     if not gen_custom_ARPSYSTEMCOMPONENT(args, dist_dir):
         sys.exit(-1)
 
-    if not gen_auto_component(app_name, dist_dir):
+    if not gen_conn_type(args):
+        sys.exit(-1)
+
+    if args.template:
+        if not gen_media2():
+            sys.exit(-1)
+        if not put_app_exe_on_media2():
+            sys.exit(-1)
+
+    if not gen_auto_component(app_name, dist_dir, args.template):
         sys.exit(-1)
 
     if not gen_custom_dialog_bitmaps():

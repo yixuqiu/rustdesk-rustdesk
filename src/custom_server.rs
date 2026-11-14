@@ -1,6 +1,9 @@
 use hbb_common::{
     bail,
-    base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _},
+    base64::{
+        engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+        Engine as _,
+    },
     sodiumoxide::crypto::sign,
     ResultType,
 };
@@ -25,7 +28,9 @@ fn get_custom_server_from_config_string(s: &str) -> ResultType<CustomServer> {
         12, 46, 129, 83, 17, 84, 193, 119, 197, 130, 103,
     ];
     let pk = sign::PublicKey(*PK);
-    let data = URL_SAFE_NO_PAD.decode(tmp)?;
+    let data = URL_SAFE_NO_PAD
+        .decode(&tmp)
+        .or_else(|_| URL_SAFE.decode(&tmp))?;
     if let Ok(lic) = serde_json::from_slice::<CustomServer>(&data) {
         return Ok(lic);
     }
@@ -56,33 +61,34 @@ pub fn get_custom_server_from_string(s: &str) -> ResultType<CustomServer> {
      *
      * This allows using a ',' (comma) symbol as a final delimiter.
      */
-    if s.contains("host=") {
-        let stripped = &s[s.find("host=").unwrap_or(0)..s.len()];
+    if s.to_lowercase().contains("host=") {
+        let stripped = &s[s.to_ascii_lowercase().find("host=").unwrap_or(0)..s.len()];
         let strs: Vec<&str> = stripped.split(",").collect();
-        let mut host = "";
-        let mut key = "";
-        let mut api = "";
-        let mut relay = "";
+        let mut host = String::default();
+        let mut key = String::default();
+        let mut api = String::default();
+        let mut relay = String::default();
         let strs_iter = strs.iter();
         for el in strs_iter {
-            if el.starts_with("host=") {
-                host = &el[5..el.len()];
+            let el_lower = el.to_lowercase();
+            if el_lower.starts_with("host=") {
+                host = el.chars().skip(5).collect();
             }
-            if el.starts_with("key=") {
-                key = &el[4..el.len()];
+            if el_lower.starts_with("key=") {
+                key = el.chars().skip(4).collect();
             }
-            if el.starts_with("api=") {
-                api = &el[4..el.len()];
+            if el_lower.starts_with("api=") {
+                api = el.chars().skip(4).collect();
             }
-            if el.starts_with("relay=") {
-                relay = &el[4..el.len()];
+            if el_lower.starts_with("relay=") {
+                relay = el.chars().skip(6).collect();
             }
         }
         return Ok(CustomServer {
-            host: host.to_owned(),
-            key: key.to_owned(),
-            api: api.to_owned(),
-            relay: relay.to_owned(),
+            host,
+            key,
+            api,
+            relay,
         });
     } else {
         let s = s
@@ -146,13 +152,39 @@ mod test {
             }
         );
         assert_eq!(
-            get_custom_server_from_string("rustdesk-host=server.example.net,key=Zm9vYmFyLiwyCg==,.exe")
-                .unwrap(),
+            get_custom_server_from_string(
+                "rustdesk-host=server.example.net,key=Zm9vYmFyLiwyCg==,.exe"
+            )
+            .unwrap(),
             CustomServer {
                 host: "server.example.net".to_owned(),
                 key: "Zm9vYmFyLiwyCg==".to_owned(),
                 api: "".to_owned(),
                 relay: "".to_owned(),
+            }
+        );
+        assert_eq!(
+            get_custom_server_from_string(
+                "rustdesk-host=server.example.net,key=Zm9vYmFyLiwyCg==,relay=server.example.net.exe"
+            )
+            .unwrap(),
+            CustomServer {
+                host: "server.example.net".to_owned(),
+                key: "Zm9vYmFyLiwyCg==".to_owned(),
+                api: "".to_owned(),
+                relay: "server.example.net".to_owned(),
+            }
+        );
+        assert_eq!(
+            get_custom_server_from_string(
+                "rustdesk-Host=server.example.net,Key=Zm9vYmFyLiwyCg==,RELAY=server.example.net.exe"
+            )
+            .unwrap(),
+            CustomServer {
+                host: "server.example.net".to_owned(),
+                key: "Zm9vYmFyLiwyCg==".to_owned(),
+                api: "".to_owned(),
+                relay: "server.example.net".to_owned(),
             }
         );
         let lic = CustomServer {
@@ -188,5 +220,33 @@ mod test {
         assert_eq!(
             get_custom_server_from_string("rustdesk-licensed--0nI900VsFHZVBVdIlncwpHS4V0bOZ0dtVldrpVO4JHdCp0YV5WdzUGZzdnYRVjI6ISeltmIsISMuEjLx4SMiojI0N3boJye--.exe")
                 .unwrap(), lic);
+        // padded base64 (one '=' after reversal) is accepted, wrong padding is not
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-licensed-=0nI900VsFHZVBVdIlncwpHS4V0bOZ0dtVldrpVO4JHdCp0YV5WdzUGZzdnYRVjI6ISeltmIsISMuEjLx4SMiojI0N3boJye.exe")
+                .unwrap(), lic);
+        assert!(
+            get_custom_server_from_string("rustdesk-licensed-==0nI900VsFHZVBVdIlncwpHS4V0bOZ0dtVldrpVO4JHdCp0YV5WdzUGZzdnYRVjI6ISeltmIsISMuEjLx4SMiojI0N3boJye.exe")
+                .is_err());
+        // bare string as passed to `--config`
+        assert_eq!(
+            get_custom_server_from_string("=0nI900VsFHZVBVdIlncwpHS4V0bOZ0dtVldrpVO4JHdCp0YV5WdzUGZzdnYRVjI6ISeltmIsISMuEjLx4SMiojI0N3boJye.exe")
+                .unwrap(), lic);
+    }
+
+    #[test]
+    fn test_filename_license_string_in_non_ascii_path() {
+        // Windows passes the full exe path, and `İ` grows from 2 to 3 bytes when lowercased.
+        assert_eq!(
+            get_custom_server_from_string(
+                r"C:\Users\İsmail\Downloads\rustdesk-host=server.example.net,key=Zm9vYmFyLiwyCg==.exe"
+            )
+            .unwrap(),
+            CustomServer {
+                host: "server.example.net".to_owned(),
+                key: "Zm9vYmFyLiwyCg==".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
     }
 }

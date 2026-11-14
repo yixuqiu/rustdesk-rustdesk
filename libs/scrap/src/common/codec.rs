@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
-    ffi::c_void,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 #[cfg(feature = "hwcodec")]
@@ -15,29 +15,34 @@ use crate::{
     aom::{self, AomDecoder, AomEncoder, AomEncoderConfig},
     common::GoogleImage,
     vpxcodec::{self, VpxDecoder, VpxDecoderConfig, VpxEncoder, VpxEncoderConfig, VpxVideoCodecId},
-    CodecFormat, CodecName, EncodeInput, EncodeYuvFormat, ImageRgb,
+    CodecFormat, EncodeInput, EncodeYuvFormat, ImageRgb, ImageTexture,
 };
 
+use base::message_proto::{
+    supported_decoding::PreferCodec, video_frame, Chroma, CodecAbility, EncodedVideoFrames,
+    SupportedDecoding, SupportedEncoding, VideoFrame,
+};
+#[cfg(any(
+    feature = "hwcodec",
+    feature = "mediacodec",
+    feature = "vram",
+    target_os = "windows"
+))]
+use hbb_common::config::option2bool;
 use hbb_common::{
     anyhow::anyhow,
     bail,
-    config::PeerConfig,
-    log,
-    message_proto::{
-        supported_decoding::PreferCodec, video_frame, Chroma, CodecAbility, EncodedVideoFrames,
-        SupportedDecoding, SupportedEncoding, VideoFrame,
-    },
+    config::{Config, PeerConfig},
+    lazy_static, log,
     sysinfo::System,
-    tokio::time::Instant,
     ResultType,
 };
-#[cfg(any(feature = "hwcodec", feature = "mediacodec", feature = "vram"))]
-use hbb_common::{config::Config2, lazy_static};
 
 lazy_static::lazy_static! {
     static ref PEER_DECODINGS: Arc<Mutex<HashMap<i32, SupportedDecoding>>> = Default::default();
     static ref ENCODE_CODEC_FORMAT: Arc<Mutex<CodecFormat>> = Arc::new(Mutex::new(CodecFormat::VP9));
     static ref THREAD_LOG_TIME: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    static ref USABLE_ENCODING: Arc<Mutex<Option<SupportedEncoding>>> = Arc::new(Mutex::new(None));
 }
 
 pub const ENCODE_NEED_SWITCH: &'static str = "ENCODE_NEED_SWITCH";
@@ -64,11 +69,17 @@ pub trait EncoderApi {
     #[cfg(feature = "vram")]
     fn input_texture(&self) -> bool;
 
-    fn set_quality(&mut self, quality: Quality) -> ResultType<()>;
+    fn set_quality(&mut self, ratio: f32) -> ResultType<()>;
 
     fn bitrate(&self) -> u32;
 
-    fn support_abr(&self) -> bool;
+    fn support_changing_quality(&self) -> bool;
+
+    fn latency_free(&self) -> bool;
+
+    fn is_hardware(&self) -> bool;
+
+    fn disable(&self);
 }
 
 pub struct Encoder {
@@ -137,7 +148,7 @@ impl Encoder {
                 }),
                 Err(e) => {
                     log::error!("new hw encoder failed: {e:?}, clear config");
-                    hbb_common::config::HwCodecConfig::clear_ram();
+                    HwCodecConfig::clear(false, true);
                     *ENCODE_CODEC_FORMAT.lock().unwrap() = CodecFormat::VP9;
                     Err(e)
                 }
@@ -149,7 +160,7 @@ impl Encoder {
                 }),
                 Err(e) => {
                     log::error!("new vram encoder failed: {e:?}, clear config");
-                    hbb_common::config::HwCodecConfig::clear_vram();
+                    HwCodecConfig::clear(true, true);
                     *ENCODE_CODEC_FORMAT.lock().unwrap() = CodecFormat::VP9;
                     Err(e)
                 }
@@ -192,7 +203,7 @@ impl Encoder {
         #[allow(unused_mut)]
         let mut h265vram_encoding = false;
         #[cfg(feature = "vram")]
-        if enable_vram_option() {
+        if enable_vram_option(true) {
             if _all_support_h264_decoding {
                 if VRamEncoder::available(CodecFormat::H264).len() > 0 {
                     h264vram_encoding = true;
@@ -235,6 +246,13 @@ impl Encoder {
             })
             .map(|(_, s)| s.prefer)
             .collect();
+        *USABLE_ENCODING.lock().unwrap() = Some(SupportedEncoding {
+            vp8: vp8_useable,
+            av1: av1_useable,
+            h264: h264_useable,
+            h265: h265_useable,
+            ..Default::default()
+        });
         // find the most frequent preference
         let mut counts = Vec::new();
         for pref in &preferences {
@@ -250,13 +268,26 @@ impl Encoder {
             .unwrap_or((PreferCodec::Auto.into(), 0));
         let preference = most_frequent.enum_value_or(PreferCodec::Auto);
 
-        #[allow(unused_mut)]
-        let mut auto_codec = CodecFormat::VP9;
-        let mut system = System::new();
-        system.refresh_memory();
-        if vp8_useable && system.total_memory() <= 4 * 1024 * 1024 * 1024 {
-            // 4 Gb
-            auto_codec = CodecFormat::VP8
+        // auto: h265 > h264 > av1/vp9/vp8
+        let av1_test = Config::get_option(base::config::keys::OPTION_AV1_TEST) != "N";
+        let mut auto_codec = if av1_useable && av1_test {
+            CodecFormat::AV1
+        } else {
+            CodecFormat::VP9
+        };
+        if h264_useable {
+            auto_codec = CodecFormat::H264;
+        }
+        if h265_useable {
+            auto_codec = CodecFormat::H265;
+        }
+        if auto_codec == CodecFormat::VP9 || auto_codec == CodecFormat::AV1 {
+            let mut system = System::new();
+            system.refresh_memory();
+            if vp8_useable && system.total_memory() <= 4 * 1024 * 1024 * 1024 {
+                // 4 Gb
+                auto_codec = CodecFormat::VP8
+            }
         }
 
         *format = match preference {
@@ -316,11 +347,15 @@ impl Encoder {
             encoding.h265 |= HwRamEncoder::try_get(CodecFormat::H265).is_some();
         }
         #[cfg(feature = "vram")]
-        if enable_vram_option() {
+        if enable_vram_option(true) {
             encoding.h264 |= VRamEncoder::available(CodecFormat::H264).len() > 0;
             encoding.h265 |= VRamEncoder::available(CodecFormat::H265).len() > 0;
         }
         encoding
+    }
+
+    pub fn usable_encoding() -> Option<SupportedEncoding> {
+        USABLE_ENCODING.lock().unwrap().clone()
     }
 
     pub fn set_fallback(config: &EncoderCfg) {
@@ -332,7 +367,14 @@ impl Encoder {
             EncoderCfg::AOM(_) => CodecFormat::AV1,
             #[cfg(feature = "hwcodec")]
             EncoderCfg::HWRAM(hw) => {
-                if hw.name.to_lowercase().contains("h264") {
+                let name = hw.name.to_lowercase();
+                if name.contains("vp8") {
+                    CodecFormat::VP8
+                } else if name.contains("vp9") {
+                    CodecFormat::VP9
+                } else if name.contains("av1") {
+                    CodecFormat::AV1
+                } else if name.contains("h264") {
                     CodecFormat::H264
                 } else {
                     CodecFormat::H265
@@ -381,7 +423,7 @@ impl Encoder {
 impl Decoder {
     pub fn supported_decodings(
         id_for_perfer: Option<&str>,
-        _flutter: bool,
+        _use_texture_render: bool,
         _luid: Option<i64>,
         mark_unsupported: &Vec<CodecFormat>,
     ) -> SupportedDecoding {
@@ -416,7 +458,7 @@ impl Decoder {
             };
         }
         #[cfg(feature = "vram")]
-        if enable_vram_option() && _flutter {
+        if enable_vram_option(false) && _use_texture_render {
             decoding.ability_h264 |= if VRamDecoder::available(CodecFormat::H264, _luid).len() > 0 {
                 1
             } else {
@@ -495,7 +537,7 @@ impl Decoder {
             }
             CodecFormat::H264 => {
                 #[cfg(feature = "vram")]
-                if !valid && enable_vram_option() && _luid.clone().unwrap_or_default() != 0 {
+                if !valid && enable_vram_option(false) && _luid.clone().unwrap_or_default() != 0 {
                     match VRamDecoder::new(format, _luid) {
                         Ok(v) => h264_vram = Some(v),
                         Err(e) => log::error!("create H264 vram decoder failed: {}", e),
@@ -521,7 +563,7 @@ impl Decoder {
             }
             CodecFormat::H265 => {
                 #[cfg(feature = "vram")]
-                if !valid && enable_vram_option() && _luid.clone().unwrap_or_default() != 0 {
+                if !valid && enable_vram_option(false) && _luid.clone().unwrap_or_default() != 0 {
                     match VRamDecoder::new(format, _luid) {
                         Ok(v) => h265_vram = Some(v),
                         Err(e) => log::error!("create H265 vram decoder failed: {}", e),
@@ -590,7 +632,7 @@ impl Decoder {
         &mut self,
         frame: &video_frame::Union,
         rgb: &mut ImageRgb,
-        _texture: &mut *mut c_void,
+        _texture: &mut ImageTexture,
         _pixelbuffer: &mut bool,
         chroma: &mut Option<Chroma>,
     ) -> ResultType<bool> {
@@ -744,12 +786,16 @@ impl Decoder {
     fn handle_vram_video_frame(
         decoder: &mut VRamDecoder,
         frames: &EncodedVideoFrames,
-        texture: &mut *mut c_void,
+        texture: &mut ImageTexture,
     ) -> ResultType<bool> {
         let mut ret = false;
         for h26x in frames.frames.iter() {
             for image in decoder.decode(&h26x.data)? {
-                *texture = image.frame.texture;
+                *texture = ImageTexture {
+                    texture: image.frame.texture,
+                    w: image.frame.width as _,
+                    h: image.frame.height as _,
+                };
                 ret = true;
             }
         }
@@ -803,28 +849,57 @@ impl Decoder {
 
 #[cfg(any(feature = "hwcodec", feature = "mediacodec"))]
 pub fn enable_hwcodec_option() -> bool {
-    if cfg!(windows) || cfg!(target_os = "linux") || cfg!(feature = "mediacodec") {
-        if let Some(v) = Config2::get().options.get("enable-hwcodec") {
-            return v != "N";
-        }
-        return true; // default is true
+    use base::config::keys::OPTION_ENABLE_HWCODEC;
+
+    if !cfg!(target_os = "ios") {
+        return option2bool(
+            OPTION_ENABLE_HWCODEC,
+            &Config::get_option(OPTION_ENABLE_HWCODEC),
+        );
     }
     false
 }
 #[cfg(feature = "vram")]
-pub fn enable_vram_option() -> bool {
-    if let Some(v) = Config2::get().options.get("enable-hwcodec") {
-        return v != "N";
+pub fn enable_vram_option(encode: bool) -> bool {
+    use base::config::keys::OPTION_ENABLE_HWCODEC;
+
+    if cfg!(windows) {
+        let enable = option2bool(
+            OPTION_ENABLE_HWCODEC,
+            &Config::get_option(OPTION_ENABLE_HWCODEC),
+        );
+        if encode {
+            enable && enable_directx_capture()
+        } else {
+            enable && allow_d3d_render()
+        }
+    } else {
+        false
     }
-    return true; // default is true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(windows)]
+pub fn enable_directx_capture() -> bool {
+    use base::config::keys::OPTION_ENABLE_DIRECTX_CAPTURE as OPTION;
+    option2bool(OPTION, &Config::get_option(OPTION))
+}
+
+#[cfg(windows)]
+pub fn allow_d3d_render() -> bool {
+    use base::config::keys::OPTION_ALLOW_D3D_RENDER as OPTION;
+    option2bool(OPTION, &hbb_common::config::LocalConfig::get_option(OPTION))
+}
+
+pub const BR_BEST: f32 = 1.5;
+pub const BR_BALANCED: f32 = 0.67;
+pub const BR_SPEED: f32 = 0.5;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Quality {
     Best,
     Balanced,
     Low,
-    Custom(u32),
+    Custom(f32),
 }
 
 impl Default for Quality {
@@ -833,20 +908,66 @@ impl Default for Quality {
     }
 }
 
-pub fn base_bitrate(width: u32, height: u32) -> u32 {
-    #[allow(unused_mut)]
-    let mut base_bitrate = ((width * height) / 1000) as u32; // same as 1.1.9
-    if base_bitrate == 0 {
-        base_bitrate = 1920 * 1080 / 1000;
+impl Quality {
+    pub fn is_custom(&self) -> bool {
+        match self {
+            Quality::Custom(_) => true,
+            _ => false,
+        }
     }
+
+    pub fn ratio(&self) -> f32 {
+        match self {
+            Quality::Best => BR_BEST,
+            Quality::Balanced => BR_BALANCED,
+            Quality::Low => BR_SPEED,
+            Quality::Custom(v) => *v,
+        }
+    }
+}
+
+pub fn base_bitrate(width: u32, height: u32) -> u32 {
+    const RESOLUTION_PRESETS: &[(u32, u32, u32)] = &[
+        (640, 480, 400),     // VGA, 307k pixels
+        (800, 600, 500),     // SVGA, 480k pixels
+        (1024, 768, 800),    // XGA, 786k pixels
+        (1280, 720, 1000),   // 720p, 921k pixels
+        (1366, 768, 1100),   // HD, 1049k pixels
+        (1440, 900, 1300),   // WXGA+, 1296k pixels
+        (1600, 900, 1500),   // HD+, 1440k pixels
+        (1920, 1080, 2073),  // 1080p, 2073k pixels
+        (2048, 1080, 2200),  // 2K DCI, 2211k pixels
+        (2560, 1440, 3000),  // 2K QHD, 3686k pixels
+        (3440, 1440, 4000),  // UWQHD, 4953k pixels
+        (3840, 2160, 5000),  // 4K UHD, 8294k pixels
+        (7680, 4320, 12000), // 8K UHD, 33177k pixels
+    ];
+    let pixels = width * height;
+
+    let (preset_pixels, preset_bitrate) = RESOLUTION_PRESETS
+        .iter()
+        .map(|(w, h, bitrate)| (w * h, bitrate))
+        .min_by_key(|(preset_pixels, _)| {
+            if *preset_pixels >= pixels {
+                preset_pixels - pixels
+            } else {
+                pixels - preset_pixels
+            }
+        })
+        .unwrap_or(((1920 * 1080) as u32, &2073)); // default 1080p
+
+    let bitrate = (*preset_bitrate as f32 * (pixels as f32 / preset_pixels as f32)).round() as u32;
+
     #[cfg(target_os = "android")]
     {
-        // fix when android screen shrinks
         let fix = crate::Display::fix_quality() as u32;
         log::debug!("Android screen, fix quality:{}", fix);
-        base_bitrate = base_bitrate * fix;
+        bitrate * fix
     }
-    base_bitrate
+    #[cfg(not(target_os = "android"))]
+    {
+        bitrate
+    }
 }
 
 pub fn codec_thread_num(limit: usize) -> usize {
@@ -859,7 +980,7 @@ pub fn codec_thread_num(limit: usize) -> usize {
     #[cfg(windows)]
     {
         res = 0;
-        let percent = hbb_common::platform::windows::cpu_uage_one_minute();
+        let percent = base::platform::windows::cpu_uage_one_minute();
         info = format!("cpu usage: {:?}", percent);
         if let Some(pecent) = percent {
             if pecent < 100.0 {
@@ -913,4 +1034,124 @@ fn disable_av1() -> bool {
     // aom is very slow for x86 sciter version on windows x64
     // disable it for all 32 bit platforms
     std::mem::size_of::<usize>() == 4
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn test_av1() {
+    use base::config::keys::OPTION_AV1_TEST;
+    use hbb_common::rand::Rng;
+    use std::{sync::Once, time::Duration};
+
+    if disable_av1() || !Config::get_option(OPTION_AV1_TEST).is_empty() {
+        log::info!("skip test av1");
+        return;
+    }
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let f = || {
+            let (width, height, quality, keyframe_interval, i444) = (1920, 1080, 1.0, None, false);
+            let frame_count = 10;
+            let block_size = 300;
+            let move_step = 50;
+            let generate_fake_data =
+                |frame_index: u32, dst_fmt: EncodeYuvFormat| -> ResultType<Vec<u8>> {
+                    let mut rng = hbb_common::rand::thread_rng();
+                    let mut bgra = vec![0u8; (width * height * 4) as usize];
+                    let gradient = frame_index as f32 / frame_count as f32;
+                    // floating block
+                    let x0 = (frame_index * move_step) % (width - block_size);
+                    let y0 = (frame_index * move_step) % (height - block_size);
+                    // Fill the block with random colors
+                    for y in 0..block_size {
+                        for x in 0..block_size {
+                            let index = (((y0 + y) * width + x0 + x) * 4) as usize;
+                            if index + 3 < bgra.len() {
+                                let noise = rng.gen_range(0..255) as f32 / 255.0;
+                                let value = (255.0 * gradient + noise * 50.0) as u8;
+                                bgra[index] = value;
+                                bgra[index + 1] = value;
+                                bgra[index + 2] = value;
+                                bgra[index + 3] = 255;
+                            }
+                        }
+                    }
+                    let dst_stride_y = dst_fmt.stride[0];
+                    let dst_stride_uv = dst_fmt.stride[1];
+                    let mut dst = vec![0u8; (dst_fmt.h * dst_stride_y * 2) as usize];
+                    let dst_y = dst.as_mut_ptr();
+                    let dst_u = dst[dst_fmt.u..].as_mut_ptr();
+                    let dst_v = dst[dst_fmt.v..].as_mut_ptr();
+                    let res = unsafe {
+                        crate::ARGBToI420(
+                            bgra.as_ptr(),
+                            (width * 4) as _,
+                            dst_y,
+                            dst_stride_y as _,
+                            dst_u,
+                            dst_stride_uv as _,
+                            dst_v,
+                            dst_stride_uv as _,
+                            width as _,
+                            height as _,
+                        )
+                    };
+                    if res != 0 {
+                        bail!("ARGBToI420 failed: {}", res);
+                    }
+                    Ok(dst)
+                };
+            let Ok(mut av1) = AomEncoder::new(
+                EncoderCfg::AOM(AomEncoderConfig {
+                    width,
+                    height,
+                    quality,
+                    keyframe_interval,
+                }),
+                i444,
+            ) else {
+                return false;
+            };
+            let mut key_frame_time = Duration::ZERO;
+            let mut non_key_frame_time_sum = Duration::ZERO;
+            let pts = Instant::now();
+            let yuvfmt = av1.yuvfmt();
+            for i in 0..frame_count {
+                let Ok(yuv) = generate_fake_data(i, yuvfmt.clone()) else {
+                    return false;
+                };
+                let start = Instant::now();
+                if av1
+                    .encode(pts.elapsed().as_millis() as _, &yuv, super::STRIDE_ALIGN)
+                    .is_err()
+                {
+                    log::debug!("av1 encode failed");
+                    if i == 0 {
+                        return false;
+                    }
+                }
+                if i == 0 {
+                    key_frame_time = start.elapsed();
+                } else {
+                    non_key_frame_time_sum += start.elapsed();
+                }
+            }
+            let non_key_frame_time = non_key_frame_time_sum / (frame_count - 1);
+            log::info!(
+                "av1 time: key: {:?}, non-key: {:?}, consume: {:?}",
+                key_frame_time,
+                non_key_frame_time,
+                pts.elapsed()
+            );
+            key_frame_time < Duration::from_millis(90)
+                && non_key_frame_time < Duration::from_millis(30)
+        };
+        std::thread::spawn(move || {
+            let v = f();
+            Config::set_option(
+                OPTION_AV1_TEST.to_string(),
+                if v { "Y" } else { "N" }.to_string(),
+            );
+        });
+    });
 }

@@ -2,6 +2,8 @@ use hbb_common::regex::Regex;
 use std::ops::Deref;
 
 mod ar;
+mod az;
+mod be;
 mod bg;
 mod ca;
 mod cn;
@@ -13,9 +15,12 @@ mod en;
 mod eo;
 mod es;
 mod et;
+mod eu;
 mod fa;
+mod gu;
 mod fr;
 mod he;
+mod hi;
 mod hr;
 mod hu;
 mod id;
@@ -28,9 +33,11 @@ mod lv;
 mod nb;
 mod nl;
 mod pl;
-mod ptbr;
+mod pt_BR;
+mod pt_PT;
 mod ro;
 mod ru;
+mod sc;
 mod sk;
 mod sl;
 mod sq;
@@ -39,8 +46,14 @@ mod sv;
 mod th;
 mod tr;
 mod tw;
-mod ua;
-mod vn;
+mod uk;
+mod ur;
+mod vi;
+mod ta;
+mod ge;
+mod fi;
+mod ml;
+mod gl;
 
 pub const LANGS: &[(&str, &str)] = &[
     ("en", "English"),
@@ -51,11 +64,14 @@ pub const LANGS: &[(&str, &str)] = &[
     ("nb", "Norsk bokmål"),
     ("zh-cn", "简体中文"),
     ("zh-tw", "繁體中文"),
-    ("pt", "Português"),
+    ("pt-pt", "Português (Portugal)"),
+    ("pt-br", "Português (Brasil)"),
     ("es", "Español"),
     ("et", "Eesti keel"),
+    ("eu", "Euskara"),
     ("hu", "Magyar"),
     ("bg", "Български"),
+    ("be", "Беларуская"),
     ("ru", "Русский"),
     ("sk", "Slovenčina"),
     ("id", "Indonesia"),
@@ -63,14 +79,16 @@ pub const LANGS: &[(&str, &str)] = &[
     ("da", "Dansk"),
     ("eo", "Esperanto"),
     ("tr", "Türkçe"),
-    ("vn", "Tiếng Việt"),
+    ("vi", "Tiếng Việt"),
     ("pl", "Polski"),
     ("ja", "日本語"),
     ("ko", "한국어"),
     ("kz", "Қазақ"),
-    ("ua", "Українська"),
+    ("uk", "Українська"),
+    ("ur", "اردو"),
     ("fa", "فارسی"),
     ("ca", "Català"),
+    ("gl", "Galego"),
     ("el", "Ελληνικά"),
     ("sv", "Svenska"),
     ("sq", "Shqip"),
@@ -83,17 +101,39 @@ pub const LANGS: &[(&str, &str)] = &[
     ("ar", "العربية"),
     ("he", "עברית"),
     ("hr", "Hrvatski"),
+    ("sc", "Sardu"),
+    ("ta", "தமிழ்"),
+    ("ge", "ქართული"),
+    ("fi", "Suomi"),
+    ("ml", "മലയാളം"),
+    ("hi", "हिंदी"),
+    ("gu", "ગુજરાતી"),
+    ("az", "Azərbaycan dili"),
 ];
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn translate(name: String) -> String {
-    let locale = sys_locale::get_locale().unwrap_or_default();
-    translate_locale(name, &locale)
+pub(crate) fn cjk_ui_unavailable() -> bool {
+    cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        feature = "flutter"
+    ))
 }
 
-pub fn translate_locale(name: String, locale: &str) -> String {
+pub(crate) fn is_cjk_lang(lang_or_locale: &str) -> bool {
+    let lang = lang_or_locale
+        .split(|c| c == '-' || c == '_')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    matches!(lang.as_str(), "zh" | "ja" | "ko")
+}
+
+fn resolve_lang(saved_lang: &str, locale: &str, cjk_fallback: bool) -> String {
     let locale = locale.to_lowercase();
-    let mut lang = hbb_common::config::LocalConfig::get_option("lang").to_lowercase();
+    let mut lang = saved_lang.to_lowercase();
+    if cjk_fallback && is_cjk_lang(&lang) {
+        return "en".to_owned();
+    }
     if lang.is_empty() {
         // zh_CN on Linux, zh-Hans-CN on mac, zh_CN_#Hans on Android
         if locale.starts_with("zh") {
@@ -101,6 +141,25 @@ pub fn translate_locale(name: String, locale: &str) -> String {
                 "zh-tw"
             } else {
                 "zh-cn"
+            })
+            .to_owned();
+            // Hong Kong, Macao and the Hant script use Traditional Chinese.
+            if !locale.contains("hans") && ["hk", "mo", "hant"].iter().any(|x| locale.contains(x)) {
+                lang = "zh-tw".to_owned();
+            }
+        }
+    }
+    if lang.is_empty() {
+        // pt_PT on Linux, pt-PT on mac, pt_PT on Android.
+        // Per CLDR locale inheritance, every Portuguese-speaking locale
+        // besides bare "pt" and Brazil's own variants (pt-BR/pt_BR) has
+        // pt-PT as its parent (Angola, Mozambique, Cape Verde, etc.),
+        // so it should resolve to European Portuguese.
+        if locale.starts_with("pt") {
+            lang = (if locale == "pt" || locale.starts_with("pt-br") || locale.starts_with("pt_br") {
+                "pt-br"
+            } else {
+                "pt-pt"
             })
             .to_owned();
         }
@@ -112,8 +171,43 @@ pub fn translate_locale(name: String, locale: &str) -> String {
             .map(|x| x.split("_").next().unwrap_or_default())
             .unwrap_or_default()
             .to_owned();
+        // The Kazakh and Georgian tables are keyed by country code, not by language code.
+        if lang == "kk" {
+            lang = "kz".to_owned();
+        } else if lang == "ka" {
+            lang = "ge".to_owned();
+        }
+        // Android 14 and older report Hebrew and Indonesian with their legacy codes (iw_IL, in_ID).
+        if lang == "iw" {
+            lang = "he".to_owned();
+        } else if lang == "in" {
+            lang = "id".to_owned();
+        }
+        // Norwegian also comes as the macrolanguage code (no_NO) or as Nynorsk (nn_NO);
+        // the only Norwegian table is Bokmål.
+        if lang == "no" || lang == "nn" {
+            lang = "nb".to_owned();
+        }
     }
-    let lang = lang.to_lowercase();
+    if cjk_fallback && is_cjk_lang(&lang) {
+        "en".to_owned()
+    } else {
+        lang
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn translate(name: String) -> String {
+    let locale = sys_locale::get_locale().unwrap_or_default();
+    translate_locale(name, &locale)
+}
+
+pub fn translate_locale(name: String, locale: &str) -> String {
+    let lang = resolve_lang(
+        &hbb_common::config::LocalConfig::get_option("lang"),
+        locale,
+        cjk_ui_unavailable(),
+    );
     let m = match lang.as_str() {
         "fr" => fr::T.deref(),
         "zh-cn" => cn::T.deref(),
@@ -124,23 +218,27 @@ pub fn translate_locale(name: String, locale: &str) -> String {
         "nl" => nl::T.deref(),
         "es" => es::T.deref(),
         "et" => et::T.deref(),
+        "eu" => eu::T.deref(),
         "hu" => hu::T.deref(),
         "ru" => ru::T.deref(),
         "eo" => eo::T.deref(),
         "id" => id::T.deref(),
-        "br" => ptbr::T.deref(),
-        "pt" => ptbr::T.deref(),
+        "br" => pt_BR::T.deref(),
+        "pt" => pt_BR::T.deref(),
+        "pt-br" => pt_BR::T.deref(),
+        "pt-pt" => pt_PT::T.deref(),
         "tr" => tr::T.deref(),
         "cs" => cs::T.deref(),
         "da" => da::T.deref(),
         "sk" => sk::T.deref(),
-        "vn" => vn::T.deref(),
+        "vi" => vi::T.deref(),
         "pl" => pl::T.deref(),
         "ja" => ja::T.deref(),
         "ko" => ko::T.deref(),
         "kz" => kz::T.deref(),
-        "ua" => ua::T.deref(),
+        "uk" => uk::T.deref(),
         "fa" => fa::T.deref(),
+        "fi" => fi::T.deref(),
         "ca" => ca::T.deref(),
         "el" => el::T.deref(),
         "sv" => sv::T.deref(),
@@ -153,8 +251,18 @@ pub fn translate_locale(name: String, locale: &str) -> String {
         "lv" => lv::T.deref(),
         "ar" => ar::T.deref(),
         "bg" => bg::T.deref(),
+        "be" => be::T.deref(),
         "he" => he::T.deref(),
         "hr" => hr::T.deref(),
+        "ur" => ur::T.deref(),
+        "sc" => sc::T.deref(),
+        "ta" => ta::T.deref(),
+        "ge" => ge::T.deref(),
+        "ml" => ml::T.deref(),
+        "hi" => hi::T.deref(),
+        "gu" => gu::T.deref(),
+        "gl" => gl::T.deref(),
+        "az" => az::T.deref(),
         _ => en::T.deref(),
     };
     let (name, placeholder_value) = extract_placeholder(&name);
@@ -168,7 +276,26 @@ pub fn translate_locale(name: String, locale: &str) -> String {
                 && !name.starts_with("upgrade_rustdesk_server_pro")
                 && name != "powered_by_me"
             {
-                s = s.replace("RustDesk", &crate::get_app_name());
+                let app_name = crate::get_app_name();
+                if !app_name.contains("RustDesk") {
+                    s = s.replace("RustDesk", &app_name);
+                } else {
+                    // https://github.com/rustdesk/rustdesk-server-pro/issues/845
+                    // If app_name contains "RustDesk" (e.g., "RustDesk-Admin"), we need to avoid
+                    // replacing "RustDesk" within the already-substituted app_name, which would
+                    // cause duplication like "RustDesk-Admin" -> "RustDesk-Admin-Admin".
+                    //
+                    // app_name only contains alphanumeric and hyphen.
+                    const PLACEHOLDER: &str = "#A-P-P-N-A-M-E#";
+                    if !s.contains(PLACEHOLDER) {
+                        s = s.replace(&app_name, PLACEHOLDER);
+                        s = s.replace("RustDesk", &app_name);
+                        s = s.replace(PLACEHOLDER, &app_name);
+                    } else {
+                        // It's very unlikely to reach here.
+                        // Skip replacement to avoid incorrect result.
+                    }
+                }
             }
         }
         s
@@ -228,5 +355,147 @@ mod test {
             f("{2} times {4} makes {8}"),
             ("{} times {4} makes {8}".to_string(), Some("2".to_string()))
         );
+    }
+
+    #[test]
+    fn test_resolve_lang_forces_english_for_cjk_locale_when_target_disables_cjk() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "zh_CN", true), "en");
+        assert_eq!(f("", "ja-JP", true), "en");
+        assert_eq!(f("", "ko_KR", true), "en");
+    }
+
+    #[test]
+    fn test_resolve_lang_preserves_cjk_when_target_allows_cjk() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("zh-cn", "en-US", false), "zh-cn");
+        assert_eq!(f("", "zh_TW", false), "zh-tw");
+        assert_eq!(f("", "ja-JP", false), "ja");
+    }
+
+    #[test]
+    fn test_resolve_lang_detects_pt_pt_and_pt_br_from_locale() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "pt-PT", false), "pt-pt");
+        assert_eq!(f("", "pt_PT", false), "pt-pt");
+        assert_eq!(f("", "pt-BR", false), "pt-br");
+        assert_eq!(f("", "pt_BR", false), "pt-br");
+        assert_eq!(f("", "pt-AO", false), "pt-pt");
+        assert_eq!(f("", "pt-MZ", false), "pt-pt");
+    }
+
+    #[test]
+    fn test_resolve_lang_detects_kazakh_and_georgian_from_locale() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "kk_KZ.UTF-8", false), "kz");
+        assert_eq!(f("", "kk-KZ", false), "kz");
+        assert_eq!(f("", "ka_GE.UTF-8", false), "ge");
+        assert_eq!(f("", "ka-GE", false), "ge");
+    }
+
+    #[test]
+    fn test_resolve_lang_detects_norwegian_from_no_and_nn_locales() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "no_NO.UTF-8", false), "nb");
+        assert_eq!(f("", "nn-NO", false), "nb");
+        assert_eq!(f("", "nb-NO", false), "nb");
+    }
+
+    #[test]
+    fn test_resolve_lang_detects_hebrew_and_indonesian_from_legacy_android_codes() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "iw_IL", false), "he");
+        assert_eq!(f("", "in_ID", false), "id");
+        assert_eq!(f("", "he-IL", false), "he");
+        assert_eq!(f("", "id-ID", false), "id");
+    }
+
+    #[test]
+    fn test_resolve_lang_detects_traditional_chinese_for_hong_kong_and_macao() {
+        use super::resolve_lang as f;
+
+        assert_eq!(f("", "zh_HK.UTF-8", false), "zh-tw");
+        assert_eq!(f("", "zh-Hant-HK", false), "zh-tw");
+        assert_eq!(f("", "zh-Hant", false), "zh-tw");
+        assert_eq!(f("", "zh_MO", false), "zh-tw");
+        assert_eq!(f("", "zh-Hans-HK", false), "zh-cn");
+    }
+
+    #[test]
+    fn test_translations_keep_the_placeholder_of_their_key() {
+        use super::*;
+
+        // translate() puts the caller's value where `{}` is, so a translation without `{}` drops it.
+        for table in [&*ru::T, &*sc::T, &*vi::T] {
+            for (key, value) in table.iter() {
+                if key.contains("{}") && !value.is_empty() {
+                    assert!(value.contains("{}"), "{key:?} => {value:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_translations_keep_the_placeholders_of_their_english_text() {
+        use super::*;
+
+        // Some callers fill `{}` themselves (Dart `.replaceAll('{}', ...)`), so the English text,
+        // not only the key, decides how many `{}` a translation needs.
+        for table in [&*fa::T, &*nl::T, &*sc::T] {
+            for (key, value) in table.iter() {
+                if value.is_empty() {
+                    continue;
+                }
+                let english = en::T.get(key).filter(|v| !v.is_empty()).unwrap_or(key);
+                assert_eq!(
+                    english.matches("{}").count(),
+                    value.matches("{}").count(),
+                    "{key:?} => {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_translations_spell_the_app_name_as_rustdesk() {
+        use super::*;
+
+        // translate() swaps the exact "RustDesk" for a custom client's name, so any other
+        // spelling stays visible in custom clients.
+        let re = hbb_common::regex::Regex::new(r"(?i)\brus?t?desk\b").unwrap();
+        for table in [&*da::T, &*el::T, &*es::T, &*nl::T, &*uk::T] {
+            for (key, value) in table.iter() {
+                for found in re.find_iter(value) {
+                    assert_eq!(found.as_str(), "RustDesk", "{key:?} => {value:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_id_input_tips_show_the_syntax_the_id_field_accepts() {
+        use super::*;
+
+        // The ID field parses `<id>@<server>?key=<key>` and `<id>@public` literally.
+        let query = hbb_common::regex::Regex::new(r"\?(\w+)=").unwrap();
+        for table in [&*ca::T, &*da::T, &*es::T, &*hr::T] {
+            for key in ["id_input_tip", "web_id_input_tip"] {
+                let value = table[key];
+                if value.is_empty() {
+                    continue;
+                }
+                assert!(value.contains("?key="), "{key:?} => {value:?}");
+                assert!(value.contains("<id>@public"), "{key:?} => {value:?}");
+                for found in query.captures_iter(value) {
+                    assert_eq!(&found[1], "key", "{key:?} => {value:?}");
+                }
+            }
+        }
     }
 }

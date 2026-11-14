@@ -1,9 +1,9 @@
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:device_info_plus/device_info_plus.dart';
-import 'package:external_path/external_path.dart';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -25,6 +25,23 @@ typedef F3 = Pointer<Uint8> Function(Pointer<Utf8>, int);
 typedef F3Dart = Pointer<Uint8> Function(Pointer<Utf8>, Int32);
 typedef HandleEvent = Future<void> Function(Map<String, dynamic> evt);
 
+/// The Linux bundle keeps the core library at lib/librustdesk.so next to the
+/// executable. Prefer that copy, mirroring flutter/linux/main.cc: the plain
+/// name relies on the loader search path, which repackaged installs may not
+/// cover. https://github.com/rustdesk/rustdesk/discussions/14407
+DynamicLibrary _openLinuxCoreLib() {
+  final bundled =
+      '${File(Platform.resolvedExecutable).parent.path}/lib/librustdesk.so';
+  try {
+    if (File(bundled).existsSync()) {
+      return DynamicLibrary.open(bundled);
+    }
+  } catch (e) {
+    debugPrint("Failed to load '$bundled': $e");
+  }
+  return DynamicLibrary.open('librustdesk.so');
+}
+
 /// FFI wrapper around the native Rust core.
 /// Hides the platform differences.
 class PlatformFFI {
@@ -42,11 +59,20 @@ class PlatformFFI {
   final _toAndroidChannel = const MethodChannel('mChannel');
 
   RustdeskImpl get ffiBind => _ffiBind;
+  @visibleForTesting
+  void setBindingForTesting(RustdeskImpl binding) => _ffiBind = binding;
+
   F3? _session_get_rgba;
 
   static get localeName => Platform.localeName;
 
   static get isMain => instance._appType == kAppTypeMain;
+
+  static String getByName(String name, [String arg = '']) {
+    return '';
+  }
+
+  static void setByName(String name, [String value = '']) {}
 
   static Future<String> getVersion() async {
     PackageInfo packageInfo = await PackageInfo.fromPlatform();
@@ -54,14 +80,14 @@ class PlatformFFI {
   }
 
   bool registerEventHandler(
-      String eventName, String handlerName, HandleEvent handler) {
+      String eventName, String handlerName, HandleEvent handler, {bool replace = false}) {
     debugPrint('registerEventHandler $eventName $handlerName');
     var handlers = _eventHandlers[eventName];
     if (handlers == null) {
       _eventHandlers[eventName] = {handlerName: handler};
       return true;
     } else {
-      if (handlers.containsKey(handlerName)) {
+      if (!replace && handlers.containsKey(handlerName)) {
         return false;
       } else {
         handlers[handlerName] = handler;
@@ -114,12 +140,16 @@ class PlatformFFI {
     final dylib = isAndroid
         ? DynamicLibrary.open('librustdesk.so')
         : isLinux
-            ? DynamicLibrary.open('librustdesk.so')
+            ? _openLinuxCoreLib()
             : isWindows
                 ? DynamicLibrary.open('librustdesk.dll')
-                : isMacOS
-                    ? DynamicLibrary.open("liblibrustdesk.dylib")
-                    : DynamicLibrary.process();
+                :
+                // Use executable itself as the dynamic library for MacOS.
+                // Multiple dylib instances will cause some global instances to be invalid.
+                // eg. `lazy_static` objects in rust side, will be created more than once, which is not expected.
+                //
+                // isMacOS? DynamicLibrary.open("liblibrustdesk.dylib") :
+                DynamicLibrary.process();
     debugPrint('initializing FFI $_appType');
     try {
       _session_get_rgba = dylib.lookupFunction<F3Dart, F3>("session_get_rgba");
@@ -132,9 +162,10 @@ class PlatformFFI {
       _ffiBind = RustdeskImpl(dylib);
 
       if (isLinux) {
-        // Start a dbus service, no need to await
-        _ffiBind.mainStartDbusServer();
-        _ffiBind.mainStartPa();
+        if (isMain) {
+          // Start a dbus service for uri links, no need to await
+          _ffiBind.mainStartDbusServer();
+        }
       } else if (isMacOS && isMain) {
         // Start ipc service for uri links.
         _ffiBind.mainStartIpcUrlServer();
@@ -142,10 +173,15 @@ class PlatformFFI {
       _startListenEvent(_ffiBind); // global event
       try {
         if (isAndroid) {
-          // only support for android
-          _homeDir = (await ExternalPath.getExternalStorageDirectories())[0];
+          // Android file transfer uses app-specific storage. User-selected
+          // files enter and leave this workspace through the system picker.
+          _homeDir = (await getExternalStorageDirectory())?.path ??
+              (await getApplicationSupportDirectory()).path;
         } else if (isIOS) {
-          _homeDir = _ffiBind.mainGetDataDirIos();
+          // The previous code was `_homeDir = (await getDownloadsDirectory())?.path ?? '';`,
+          // which provided the `downloads` path in the sandbox.
+          // It is unclear why we now use the `data` directory in the sandbox instead.
+          _homeDir = _ffiBind.mainGetDataDirIos(appDir: _dir);
         } else {
           // no need to set home dir
         }
@@ -252,6 +288,16 @@ class PlatformFFI {
 
   void setRgbaCallback(void Function(int, Uint8List) fun) async {}
 
+  // web only
+  void setCursorDataCallback(
+      void Function(String, int, int, int, int, Uint8List) fun) async {}
+
+  // web only, decoded WebCodecs frames arriving as ready-made images
+  void setVideoFrameCallback(
+      Future<void> Function(int, ui.Image, bool Function()) fun) {}
+
+  void clearVideoFrameCallback() {}
+
   void startDesktopWebListener() {}
 
   void stopDesktopWebListener() {}
@@ -268,7 +314,15 @@ class PlatformFFI {
     return await _toAndroidChannel.invokeMethod(method, arguments);
   }
 
+  Future<T?> invokeMethodWithResult<T>(String method,
+      [dynamic arguments]) async {
+    if (!isAndroid) return null;
+    return await _toAndroidChannel.invokeMethod<T>(method, arguments);
+  }
+
   void syncAndroidServiceAppDirConfigPath() {
     invokeMethod(AndroidChannel.kSyncAppDirConfigPath, _dir);
   }
+
+  void setFullscreenCallback(void Function(bool) fun) {}
 }
